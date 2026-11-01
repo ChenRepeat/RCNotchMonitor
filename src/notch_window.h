@@ -34,9 +34,11 @@ private:
 
     bool InitD2D();
     void CleanupD2D();
+    void EnsureCanvas(int reqW, int reqH);
+    void FreeCanvas();
     void OnTimerTick();
     void RenderAndPresent();
-    void RenderToTarget(ID2D1RenderTarget* rt, int logWidth, int logHeight, float expandRatio, float scale);
+    void RenderToTarget(ID2D1RenderTarget* rt, float canvasLogW, float drawW, float drawH, float expandRatio, float scale);
 
     void DrawFaIcon(ID2D1RenderTarget* rt, FaIconType icon, float cx, float cy, float size, ID2D1Brush* brush);
     void DrawNotchShape(ID2D1RenderTarget* rt, float w, float h, float radius, D2D1_COLOR_F fillCol, D2D1_COLOR_F borderCol);
@@ -52,16 +54,28 @@ private:
     IDWriteFactory* m_dwriteFactory = nullptr;
     ID2D1DCRenderTarget* m_dcRenderTarget = nullptr;
 
+    // Persistent offscreen DIB canvas to avoid per-frame allocations & DWM surface thrashing
+    HDC m_memDC = NULL;
+    HBITMAP m_dibBmp = NULL;
+    HBITMAP m_oldBmp = NULL;
+    void* m_dibBits = nullptr;
+    int m_canvasW = 0;
+    int m_canvasH = 0;
+
+    // High-resolution timing for smooth frame-rate-independent animation
+    LARGE_INTEGER m_qpcFreq = {};
+    LARGE_INTEGER m_lastTick = {};
+
     // Animation & Interaction state
     bool m_isHovered = false;
     bool m_trackingMouse = false;
-    int m_hoverButtonId = 0; // 0: none, 1: Settings, 2: Layout toggle, 3: Lock click-through
+    int m_hoverButtonId = 0;     // 0: none, 1: Settings, 2: Layout toggle, 3: Lock click-through
     float m_animProgress = 0.0f; // 0.0 = collapsed, 1.0 = expanded
-    float m_layoutAnim = 0.0f;   // 0.0 = Dual-Row (2x2 dots), 1.0 = Single-Row (1x4 dots)
+    float m_layoutAnim = 0.0f;   // 0.0 = Dual-Row (2x2), 1.0 = Single-Row (1x4)
     float m_currW = 260.0f;
     float m_currH = 36.0f;
 
-    // Interactive button rects in Expanded mode
+    // Interactive button rects in Expanded mode (in canvas logical coordinates)
     D2D1_RECT_F m_btnSettingsRect = {};
     D2D1_RECT_F m_btnLayoutRect = {};
     D2D1_RECT_F m_btnLockRect = {};

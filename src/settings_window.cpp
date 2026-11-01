@@ -66,11 +66,58 @@ static bool IsDragZoneId(int zoneId) {
     return (zoneId >= ZONE_ROW_BASE && zoneId < ZONE_ROW_BASE + 40 && ((zoneId - ZONE_ROW_BASE) % 10 == 6));
 }
 
-SettingsWindow::SettingsWindow() {}
+SettingsWindow::SettingsWindow() {
+    QueryPerformanceFrequency(&m_qpcFreq);
+    QueryPerformanceCounter(&m_lastTick);
+}
 
 SettingsWindow::~SettingsWindow() {
     if (m_hwnd) DestroyWindow(m_hwnd);
     CleanupD2D();
+}
+
+void SettingsWindow::FreeOffscreen() {
+    if (m_memDC) {
+        if (m_oldBmp) {
+            SelectObject(m_memDC, m_oldBmp);
+            m_oldBmp = NULL;
+        }
+        if (m_dibBmp) {
+            DeleteObject(m_dibBmp);
+            m_dibBmp = NULL;
+        }
+        DeleteDC(m_memDC);
+        m_memDC = NULL;
+    }
+    m_bufW = 0;
+    m_bufH = 0;
+}
+
+void SettingsWindow::EnsureOffscreen(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (m_memDC && m_dibBmp && m_bufW == w && m_bufH == h) return;
+    FreeOffscreen();
+
+    HDC hdcScreen = GetDC(NULL);
+    m_memDC = CreateCompatibleDC(hdcScreen);
+    ReleaseDC(NULL, hdcScreen);
+    if (!m_memDC) return;
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pvBits = nullptr;
+    m_dibBmp = CreateDIBSection(m_memDC, &bmi, DIB_RGB_COLORS, &pvBits, NULL, 0);
+    if (m_dibBmp) {
+        m_oldBmp = (HBITMAP)SelectObject(m_memDC, m_dibBmp);
+        m_bufW = w;
+        m_bufH = h;
+    }
 }
 
 bool SettingsWindow::InitD2D() {
@@ -88,6 +135,7 @@ bool SettingsWindow::InitD2D() {
 }
 
 void SettingsWindow::CleanupD2D() {
+    FreeOffscreen();
     if (m_dcRenderTarget) { m_dcRenderTarget->Release(); m_dcRenderTarget = nullptr; }
     if (m_dwriteFactory) { m_dwriteFactory->Release(); m_dwriteFactory = nullptr; }
     if (m_d2dFactory) { m_d2dFactory->Release(); m_d2dFactory = nullptr; }
@@ -139,12 +187,14 @@ bool SettingsWindow::Create(HINSTANCE hInstance, AppConfig* config) {
     DwmSetWindowAttribute(m_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     DWORD cornerPref = 2; // DWMWCP_ROUND
     DwmSetWindowAttribute(m_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &cornerPref, sizeof(cornerPref));
-    SetTimer(m_hwnd, TIMER_SETTINGS_ANIM, 16, NULL);
+    QueryPerformanceCounter(&m_lastTick);
+    SetTimer(m_hwnd, TIMER_SETTINGS_ANIM, 8, NULL);
     return true;
 }
 
 void SettingsWindow::Show() {
     if (!m_hwnd) return;
+    QueryPerformanceCounter(&m_lastTick);
     if (m_config) {
         m_layoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
         for (int pos = 0; pos < 4; ++pos) {
@@ -187,9 +237,11 @@ void SettingsWindow::CommitTempEdit() {
     m_tempEditStr.clear();
 }
 
-void SettingsWindow::NotifyChanged() {
+void SettingsWindow::NotifyChanged(bool saveToDisk) {
     if (!m_config) return;
-    m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
+    if (saveToDisk) {
+        m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
+    }
     if (onConfigUpdated) onConfigUpdated();
     if (m_hwnd) InvalidateRect(m_hwnd, NULL, FALSE);
 }
@@ -608,7 +660,7 @@ void SettingsWindow::HandleZoneClick(int zoneId, float mx, float my, const D2D1_
         int raw = minV + (int)std::round(pct * (maxV - minV));
         if (step > 1) raw = ((raw + step / 2) / step) * step;
         field = std::clamp(raw, minV, maxV);
-        NotifyChanged();
+        NotifyChanged(false);
     };
 
     switch (zoneId) {
@@ -635,12 +687,13 @@ void SettingsWindow::HandleZoneClick(int zoneId, float mx, float my, const D2D1_
         int pctVal = (m_config->bgOpacity * 100) / 255;
         updateSlider(pctVal, 35, 100, 1);
         m_config->bgOpacity = std::clamp((pctVal * 255) / 100, 89, 255);
-        NotifyChanged();
+        NotifyChanged(false);
         return;
     }
     case ZONE_BTN_LAYOUT:
+        QueryPerformanceCounter(&m_lastTick);
         m_config->layoutMode = (m_config->layoutMode == 0) ? 1 : 0;
-        NotifyChanged();
+        NotifyChanged(true);
         return;
     case ZONE_BTN_REFRESH:
         if (m_config->refreshIntervalMs == 250) m_config->refreshIntervalMs = 500;
@@ -770,24 +823,37 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_TIMER:
         if (wParam == TIMER_SETTINGS_ANIM && m_config && IsWindowVisible(m_hwnd)) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            float dt = (m_qpcFreq.QuadPart > 0)
+                ? (float)(now.QuadPart - m_lastTick.QuadPart) / (float)m_qpcFreq.QuadPart
+                : 0.008f;
+            m_lastTick = now;
+            dt = std::clamp(dt, 0.001f, 0.050f);
+
             bool dirty = false;
             float targetLay = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
-            if (std::fabs(m_layoutAnim - targetLay) > 0.005f) {
-                m_layoutAnim += (targetLay - m_layoutAnim) * 0.22f;
+            if (std::fabs(m_layoutAnim - targetLay) > 0.002f) {
+                float step = dt / 0.26f;
+                if (m_layoutAnim < targetLay)
+                    m_layoutAnim = std::min(targetLay, m_layoutAnim + step);
+                else
+                    m_layoutAnim = std::max(targetLay, m_layoutAnim - step);
                 dirty = true;
             } else if (m_layoutAnim != targetLay) {
                 m_layoutAnim = targetLay;
                 dirty = true;
             }
 
-            // 60FPS tween animation for row vertical positions during & after drag-reorder
+            // High-FPS frame-rate-independent tween animation for row vertical positions
+            float rowAlpha = 1.0f - std::exp(-24.0f * dt);
             for (int pos = 0; pos < 4; ++pos) {
                 int mIdx = m_config->itemOrder[pos];
                 if (mIdx < 0 || mIdx >= 4) continue;
                 if (mIdx == m_draggingMetric) continue; // Actively dragged row follows cursor directly
                 float targetY = 236.0f + pos * 40.0f;
-                if (std::fabs(m_rowVisualY[mIdx] - targetY) > 0.25f) {
-                    m_rowVisualY[mIdx] += (targetY - m_rowVisualY[mIdx]) * 0.28f;
+                if (std::fabs(m_rowVisualY[mIdx] - targetY) > 0.15f) {
+                    m_rowVisualY[mIdx] += (targetY - m_rowVisualY[mIdx]) * rowAlpha;
                     dirty = true;
                 } else if (m_rowVisualY[mIdx] != targetY) {
                     m_rowVisualY[mIdx] = targetY;
@@ -809,8 +875,13 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         int w = rc.right - rc.left;
         int h = rc.bottom - rc.top;
         if (m_dcRenderTarget && w > 0 && h > 0) {
-            if (SUCCEEDED(m_dcRenderTarget->BindDC(hdc, &rc))) {
-                RenderToTarget(m_dcRenderTarget, w, h);
+            EnsureOffscreen(w, h);
+            if (m_memDC && m_dibBmp) {
+                RECT rcBuf = { 0, 0, w, h };
+                if (SUCCEEDED(m_dcRenderTarget->BindDC(m_memDC, &rcBuf))) {
+                    RenderToTarget(m_dcRenderTarget, w, h);
+                }
+                BitBlt(hdc, 0, 0, w, h, m_memDC, 0, 0, SRCCOPY);
             }
         }
         EndPaint(m_hwnd, &ps);
@@ -835,12 +906,13 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
             if (curPos >= 0 && targetPos != curPos) {
+                QueryPerformanceCounter(&m_lastTick);
                 int step = (targetPos > curPos) ? 1 : -1;
                 for (int p = curPos; p != targetPos; p += step) {
                     m_config->itemOrder[p] = m_config->itemOrder[p + step];
                 }
                 m_config->itemOrder[targetPos] = m_draggingMetric;
-                NotifyChanged();
+                NotifyChanged(false);
             } else {
                 InvalidateRect(m_hwnd, NULL, FALSE);
             }
@@ -907,6 +979,7 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             m_draggingMetric = -1;
             m_draggingSliderZone = -1;
             ReleaseCapture();
+            if (m_config) m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
             InvalidateRect(m_hwnd, NULL, FALSE);
         }
         return 0;

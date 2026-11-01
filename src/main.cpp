@@ -1,5 +1,6 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <mmsystem.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
 #include <psapi.h>
@@ -389,6 +390,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         return 0;
     }
 
+    timeBeginPeriod(1);
+
     AppConfig config;
     config.LoadFromFile(AppConfig::GetDefaultConfigPath());
     g_pConfig = &config;
@@ -457,6 +460,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
 
     telemetry.Stop();
     notch.Destroy();
+    timeEndPeriod(1);
     CloseHandle(hMutex);
     return 0;
 }

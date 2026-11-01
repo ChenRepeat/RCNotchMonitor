@@ -112,8 +112,8 @@ static void GetDualAndSingleLogicalSize(const AppConfig* cfg, float& outDualW, f
     float baseW = (float)((cfg->notchWidth / 4) * 4);
     int active = cfg->GetActiveMetricCount();
     float sW = baseW;
-    if (active >= 4) sW = cfg->notchWidth * 1.52f;
-    else if (active == 3) sW = cfg->notchWidth * 1.24f;
+    if (active >= 4) sW = cfg->notchWidth * 1.76f;
+    else if (active == 3) sW = cfg->notchWidth * 1.36f;
     outDualW = baseW;
     outSingleW = (float)(((int)std::round(sW / 4.0f)) * 4);
 
@@ -149,7 +149,7 @@ bool NotchWindow::Create(HINSTANCE hInstance, AppConfig* config, TelemetryEngine
     float wDual = 260.0f, hDual = 36.0f, wSingle = 396.0f, hSingle = 28.0f;
     GetDualAndSingleLogicalSize(m_config, wDual, hDual, wSingle, hSingle);
     float easeLayout = Smoothstep01(m_layoutAnim);
-    float medExtra = (180.0f + 18.0f * easeLayout) * Smoothstep01(m_mediaAnim);
+    float medExtra = (204.0f + 20.0f * easeLayout) * Smoothstep01(m_mediaAnim);
     m_currW = wDual + (wSingle - wDual) * easeLayout + medExtra;
     m_currH = hDual + (hSingle - hDual) * easeLayout;
     QueryPerformanceCounter(&m_lastTick);
@@ -532,7 +532,7 @@ void NotchWindow::OnTimerTick() {
     float easeExpand = Smoothstep01(m_animProgress);
     float easeMedia  = Smoothstep01(m_mediaAnim);
 
-    float medCollapsedW = (180.0f + 18.0f * easeLayout) * easeMedia;
+    float medCollapsedW = (204.0f + 20.0f * easeLayout) * easeMedia;
     float collapsedW = wDual + (wSingle - wDual) * easeLayout + medCollapsedW;
     float collapsedH = hDual + (hSingle - hDual) * easeLayout;
 
@@ -763,7 +763,7 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
 
     float padX = 20.0f;
     float innerH = h - 4.0f;
-    float medAllocatedW = (180.0f + 18.0f * layoutT) * easeMedia;
+    float medAllocatedW = (204.0f + 20.0f * layoutT) * easeMedia;
 
     // Determine horizontal sub-regions for Hardware Block and Media Block
     float totalInnerW = std::max(40.0f, w - padX * 2.0f);
@@ -774,7 +774,7 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
     // ==================== 1. Draw Collapsed Media Block (Source Art + Marquee + Audio Peak) ====================
     if (easeMedia > 0.02f && !snap.mediaTitle.empty()) {
         float medAlpha = alpha * easeMedia;
-        float medBoxW = 132.0f + 10.0f * layoutT;
+        float medBoxW = 156.0f + 14.0f * layoutT;
         float medX_Left  = padX;
         float medX_Right = w - padX - medBoxW;
         float medX = medX_Left + (medX_Right - medX_Left) * easeDock;
@@ -911,8 +911,8 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
         items[i].val2 = buf2;
     }
 
-    float titleValGap = 4.0f;
-    float tempSlotGap = 4.0f;
+    float titleValGap = 6.0f;
+    float tempSlotGap = 6.0f;
 
     float wDualRef = 260.0f, hDualRef = 36.0f, wSingleRef = 396.0f, hSingleRef = 28.0f;
     GetDualAndSingleLogicalSize(m_config, wDualRef, hDualRef, wSingleRef, hSingleRef);
@@ -1511,7 +1511,7 @@ bool NotchWindow::SavePreviewBmp(const std::wstring& bmpPath, bool expandedState
     float easeMedia  = Smoothstep01(m_mediaAnim);
     float scale = m_config->GetEffectiveScale();
 
-    float baseW = m_config->GetCollapsedLogicalWidth() + (160.0f + 16.0f * easeLayout) * easeMedia;
+    float baseW = m_config->GetCollapsedLogicalWidth() + (204.0f + 20.0f * easeLayout) * easeMedia;
     float baseH = m_config->GetCollapsedLogicalHeight();
     float expW  = (float)m_config->expandedWidth + 208.0f * easeMedia;
     float expH  = (float)m_config->expandedHeight;

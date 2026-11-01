@@ -100,11 +100,11 @@ static void ShowTrayContextMenu(HWND hwnd) {
     HMENU hMenu = CreatePopupMenu();
     if (!hMenu || !g_pConfig) return;
 
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"⚙ 開啟外觀與欄位設定 (Ctrl+Alt+S)");
     AppendMenuW(hMenu, MF_STRING | (g_pConfig->clickThroughLocked ? MF_CHECKED : 0),
-                ID_TRAY_LOCK, L"🔒 鎖定滑鼠穿透 (Ctrl+Alt+N)");
+                ID_TRAY_LOCK, L"穿透鎖定");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"設置");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"✕ 結束螢幕瀏海監控");
+    AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"關閉");
 
     POINT pt;
     GetCursorPos(&pt);

@@ -109,8 +109,8 @@ float AppConfig::GetCollapsedLogicalWidth() const {
     float w = (float)((notchWidth / 4) * 4);
     if (layoutMode == 1) {
         int active = GetActiveMetricCount();
-        if (active >= 4) w = notchWidth * 1.52f;
-        else if (active == 3) w = notchWidth * 1.24f;
+        if (active >= 4) w = notchWidth * 1.76f;
+        else if (active == 3) w = notchWidth * 1.36f;
     }
     return (float)(((int)std::round(w / 4.0f)) * 4);
 }

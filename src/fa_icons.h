@@ -284,10 +284,10 @@ inline void DrawFaIcon(ID2D1Factory* factory, ID2D1RenderTarget* rt, FaIconType 
         }
         break;
     }
-    case FA_ICON_GRIP: { // fa-grip-vertical (2x3 6-dot drag handle)
-        float dx = r * 0.36f;
-        float dy = r * 0.56f;
-        float dotR = r * 0.18f;
+    case FA_ICON_GRIP: { // fa-grip-vertical (2x3 6-dot drag handle, enlarged & clear)
+        float dx = r * 0.38f;
+        float dy = r * 0.58f;
+        float dotR = r * 0.22f;
         for (int row = -1; row <= 1; ++row) {
             rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx - dx, cy + row * dy), dotR, dotR), brush);
             rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + dx, cy + row * dy), dotR, dotR), brush);

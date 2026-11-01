@@ -214,15 +214,13 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     DWORD pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == GetCurrentProcessId()) return;
 
+    // Strict Focused-Application Filter:
+    // Only capture present events belonging to the currently focused (active) window process!
+    DWORD fgPid = g_foregroundPid.load(std::memory_order_relaxed);
+    if (fgPid == 0 || pid != fgPid) return;
+
     DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
     if (excluded != 0 && pid == excluded) return;
-
-    DWORD fgPid = g_foregroundPid.load(std::memory_order_relaxed);
-    if (fgPid != 0 && pid != fgPid) {
-        if (!g_isFgGameCandidate.load(std::memory_order_relaxed)) {
-            return;
-        }
-    }
 
     // DXGI Present_Start is Event ID 42, D3D9 Present_Start is Event ID 1
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;

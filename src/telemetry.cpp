@@ -6,6 +6,7 @@
 #include <intrin.h>
 #include <powrprof.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <evntrace.h>
 #include <evntcons.h>
 #include <dxgi1_4.h>
@@ -178,16 +179,26 @@ static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xA
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
 
 static uint64_t g_qpcFreq = 0;
+static std::atomic<DWORD> g_dwmPid{0};
+static std::atomic<DWORD> g_activeGamePid{0};
+static std::atomic<uint64_t> g_lastGamePresentQpc{0};
+static std::atomic<bool> g_userOnDesktop{false};
 
 static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
     if (!exeName || !*exeName) return false;
     static const wchar_t* const s_excluded[] = {
         L"explorer.exe", L"dwm.exe", L"shellexperiencehost.exe", L"searchhost.exe",
-        L"taskmgr.exe", L"systemsettings.exe", L"applicationframehost.exe",
+        L"startmenuexperiencehost.exe", L"taskmgr.exe", L"systemsettings.exe",
+        L"applicationframehost.exe", L"lockapp.exe", L"logonui.exe", L"csrss.exe",
+        L"services.exe", L"lsass.exe", L"svchost.exe", L"winlogon.exe",
+        L"textinputhost.exe", L"ctfmon.exe", L"gamebar.exe", L"gamebarft.exe",
+        L"xboxgamebar.exe", L"gamebarpresencewriter.exe",
         L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
         L"code.exe", L"devenv.exe", L"notepad.exe", L"notepad++.exe", L"sublime_text.exe",
+        L"powershell.exe", L"cmd.exe", L"wt.exe", L"conhost.exe",
         L"spotify.exe", L"discord.exe", L"slack.exe", L"teams.exe", L"steam.exe",
         L"steamwebhelper.exe", L"epicgameslauncher.exe", L"galaxyclient.exe",
+        L"eadesktop.exe", L"battlenet.exe", L"riotclientservices.exe",
         L"rcnotchmonitor.exe", L"win-notch-monitor.exe"
     };
     for (const auto* ex : s_excluded) {
@@ -198,17 +209,40 @@ static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
 
 static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
     if (pid == 0) return false;
+
+    // 1. Try standard QueryFullProcessImageName
     HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProcess) return false;
-    DWORD len = maxLen;
-    BOOL ok = QueryFullProcessImageNameW(hProcess, 0, outName, &len);
-    CloseHandle(hProcess);
-    if (!ok) return false;
-    const wchar_t* p = wcsrchr(outName, L'\\');
-    if (p) {
-        wmemmove(outName, p + 1, (wcslen(p + 1) + 1) * sizeof(wchar_t));
+    if (hProcess) {
+        DWORD len = maxLen;
+        BOOL ok = QueryFullProcessImageNameW(hProcess, 0, outName, &len);
+        CloseHandle(hProcess);
+        if (ok && len > 0) {
+            const wchar_t* p = wcsrchr(outName, L'\\');
+            if (p) {
+                wmemmove(outName, p + 1, (wcslen(p + 1) + 1) * sizeof(wchar_t));
+            }
+            return true;
+        }
     }
-    return true;
+
+    // 2. Fallback to Toolhelp32Snapshot (works on system processes, DWM, and protected games)
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (pe.th32ProcessID == pid) {
+                    wcsncpy_s(outName, maxLen, pe.szExeFile, _TRUNCATE);
+                    CloseHandle(hSnap);
+                    return true;
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    return false;
 }
 
 // Fast lockless cache for process exclusion (avoids OpenProcess in ETW hot path)
@@ -216,40 +250,58 @@ struct PidExclusionCache {
     struct Entry {
         std::atomic<DWORD> pid{0};
         bool excluded{false};
+        wchar_t name[64] = {0};
     };
-    static constexpr size_t CACHE_SIZE = 32;
+    static constexpr size_t CACHE_SIZE = 64;
     Entry entries[CACHE_SIZE];
 
-    bool IsPidExcluded(DWORD pid) {
+    bool IsPidExcluded(DWORD pid, wchar_t* optOutName = nullptr, DWORD optMaxLen = 0) {
         if (pid == 0 || pid == GetCurrentProcessId()) return true;
         for (size_t i = 0; i < CACHE_SIZE; ++i) {
             if (entries[i].pid.load(std::memory_order_relaxed) == pid) {
+                if (optOutName && optMaxLen > 0) {
+                    wcsncpy_s(optOutName, optMaxLen, entries[i].name, _TRUNCATE);
+                }
                 return entries[i].excluded;
             }
         }
         wchar_t exeName[MAX_PATH] = {0};
         bool hasExe = GetProcessExeName(pid, exeName, MAX_PATH);
-        bool excluded = hasExe && IsExcludedDesktopProcess(exeName);
+        bool excluded = false;
+        if (hasExe) {
+            excluded = IsExcludedDesktopProcess(exeName);
+        } else {
+            DWORD dwm = g_dwmPid.load(std::memory_order_relaxed);
+            if (dwm != 0 && pid == dwm) {
+                excluded = true;
+                wcscpy_s(exeName, L"dwm.exe");
+            }
+        }
 
         static std::atomic<size_t> insertIdx{0};
         size_t idx = insertIdx.fetch_add(1, std::memory_order_relaxed) % CACHE_SIZE;
         entries[idx].excluded = excluded;
+        wcsncpy_s(entries[idx].name, 64, exeName, _TRUNCATE);
         entries[idx].pid.store(pid, std::memory_order_release);
+
+        if (optOutName && optMaxLen > 0) {
+            wcsncpy_s(optOutName, optMaxLen, exeName, _TRUNCATE);
+        }
         return excluded;
     }
 };
 static PidExclusionCache g_pidCache;
-
-static std::atomic<DWORD> g_targetGamePid{0};
-static std::atomic<uint64_t> g_lastPresentQpc{0};
 
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (!pEvent || !g_pEtwFrameCounter) return;
     DWORD pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == GetCurrentProcessId()) return;
 
-    DWORD target = g_targetGamePid.load(std::memory_order_relaxed);
-    if (target == 0 || pid != target) return;
+    DWORD dwm = g_dwmPid.load(std::memory_order_relaxed);
+    if (dwm != 0 && pid == dwm) return;
+
+    // Filter out excluded desktop/system/browser processes
+    if (g_pidCache.IsPidExcluded(pid)) return;
 
     // Supported Presentation Start Events:
     // 42: DXGI Present_Start
@@ -257,16 +309,39 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     // 1:  D3D9 Present_Start
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
     if (id == 42 || id == 55 || id == 1) {
+        DWORD activeGame = g_activeGamePid.load(std::memory_order_relaxed);
+
+        if (activeGame == 0) {
+            // If user is not intentionally idle on the desktop/browsing, adopt this presenting 3D process
+            if (!g_userOnDesktop.load(std::memory_order_relaxed)) {
+                g_activeGamePid.store(pid, std::memory_order_relaxed);
+                activeGame = pid;
+            } else {
+                return;
+            }
+        } else if (pid != activeGame) {
+            // If active game PID hasn't presented for > 2 seconds, switch to currently presenting app
+            uint64_t lastActiveQpc = g_lastGamePresentQpc.load(std::memory_order_relaxed);
+            uint64_t nowQpc = 0;
+            QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
+            if (g_qpcFreq > 0 && lastActiveQpc > 0 && (nowQpc - lastActiveQpc) > (g_qpcFreq * 2)) {
+                g_activeGamePid.store(pid, std::memory_order_relaxed);
+                activeGame = pid;
+            } else {
+                return; // Discard events from non-active background processes
+            }
+        }
+
         uint64_t qpc = 0;
         QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&qpc));
 
-        // Deduplication window: discard duplicate present markers within 0.8ms (supports up to 1250 FPS)
-        uint64_t lastQpc = g_lastPresentQpc.load(std::memory_order_relaxed);
-        uint64_t minInterval = (g_qpcFreq > 0) ? (g_qpcFreq / 1250) : 0;
+        // Deduplication window: discard duplicate present markers within 0.5ms (supports up to 2000 real FPS)
+        uint64_t lastQpc = g_lastGamePresentQpc.load(std::memory_order_relaxed);
+        uint64_t minInterval = (g_qpcFreq > 0) ? (g_qpcFreq / 2000) : 0;
         if (minInterval > 0 && lastQpc > 0 && (qpc >= lastQpc) && (qpc - lastQpc) < minInterval) {
             return; // Duplicate event in same present transaction
         }
-        g_lastPresentQpc.store(qpc, std::memory_order_relaxed);
+        g_lastGamePresentQpc.store(qpc, std::memory_order_relaxed);
 
         g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
     }
@@ -301,6 +376,12 @@ TelemetryEngine::TelemetryEngine(bool verifyMockMode) {
         LARGE_INTEGER freq = {};
         QueryPerformanceFrequency(&freq);
         g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
+    }
+    HWND hDwm = FindWindowW(L"Dwm", NULL);
+    if (hDwm) {
+        DWORD dwmPid = 0;
+        GetWindowThreadProcessId(hDwm, &dwmPid);
+        if (dwmPid != 0) g_dwmPid.store(dwmPid, std::memory_order_relaxed);
     }
 }
 
@@ -799,16 +880,13 @@ static bool IsForegroundWindowFullscreenGame(DWORD& outPid) {
 }
 
 static bool IsDesktopOrShellWindow(HWND hwnd) {
-    if (!hwnd) return true;
+    if (!hwnd) return false;
     wchar_t cls[128] = {0};
     if (GetClassNameW(hwnd, cls, 128) == 0) return false;
     if (_wcsicmp(cls, L"Progman") == 0 ||
         _wcsicmp(cls, L"WorkerW") == 0 ||
         _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
-        _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
-        _wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
-        _wcsicmp(cls, L"ImmersiveLauncher") == 0 ||
-        _wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+        _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0) {
         return true;
     }
     return false;
@@ -828,28 +906,43 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
     }
 
+    // Refresh DWM PID if not yet set
+    if (g_dwmPid.load(std::memory_order_relaxed) == 0) {
+        HWND hDwm = FindWindowW(L"Dwm", NULL);
+        if (hDwm) {
+            DWORD dwmPid = 0;
+            GetWindowThreadProcessId(hDwm, &dwmPid);
+            if (dwmPid != 0) g_dwmPid.store(dwmPid, std::memory_order_relaxed);
+        }
+    }
+
     HWND hwnd = GetForegroundWindow();
     DWORD fgPid = 0;
     if (hwnd) {
         GetWindowThreadProcessId(hwnd, &fgPid);
     }
-
     DWORD currentSelfPid = GetCurrentProcessId();
 
-    // Foreground Game Detection:
-    if (fgPid != currentSelfPid) {
-        if (!hwnd || fgPid == 0 || IsDesktopOrShellWindow(hwnd)) {
-            // User is on desktop or Windows taskbar -> no active game
-            g_targetGamePid.store(0, std::memory_order_relaxed);
+    // Focus & Desktop State Evaluation:
+    // If foreground is our own Notch / Settings window, ignore (keep previous game state intact!)
+    if (fgPid != 0 && fgPid != currentSelfPid) {
+        if (IsDesktopOrShellWindow(hwnd)) {
+            // User explicitly focused the desktop or taskbar
+            g_userOnDesktop.store(true, std::memory_order_relaxed);
+            g_activeGamePid.store(0, std::memory_order_relaxed);
+            m_stableFps = 0;
         } else {
-            wchar_t exeName[MAX_PATH] = {0};
-            bool hasExe = GetProcessExeName(fgPid, exeName, MAX_PATH);
-            if (hasExe && IsExcludedDesktopProcess(exeName)) {
-                // User is in browser, spotify, code editor, etc. -> no active game
-                g_targetGamePid.store(0, std::memory_order_relaxed);
+            wchar_t fgExe[MAX_PATH] = {0};
+            bool isExcluded = g_pidCache.IsPidExcluded(fgPid, fgExe, MAX_PATH);
+            if (isExcluded) {
+                // User is in a browser, code editor, or other excluded desktop app
+                g_userOnDesktop.store(true, std::memory_order_relaxed);
+                g_activeGamePid.store(0, std::memory_order_relaxed);
+                m_stableFps = 0;
             } else {
                 // Foreground window belongs to a game (e.g. MonsterHunterWilds.exe)
-                g_targetGamePid.store(fgPid, std::memory_order_relaxed);
+                g_userOnDesktop.store(false, std::memory_order_relaxed);
+                g_activeGamePid.store(fgPid, std::memory_order_relaxed);
             }
         }
     }
@@ -867,13 +960,14 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             uint32_t frames = m_etwFrameCount.exchange(0, std::memory_order_relaxed);
             m_lastFpsQpc = nowQpc;
 
-            DWORD currentTarget = g_targetGamePid.load(std::memory_order_relaxed);
+            DWORD activeGame = g_activeGamePid.load(std::memory_order_relaxed);
+            bool onDesktop = g_userOnDesktop.load(std::memory_order_relaxed);
 
-            if (currentTarget != 0 && frames > 0 && elapsedSec > 0.0) {
+            if (!onDesktop && activeGame != 0 && frames > 0 && elapsedSec > 0.0) {
                 float rawFps = static_cast<float>(static_cast<double>(frames) / elapsedSec);
                 if (rawFps >= 10.0f) {
                     int rounded = static_cast<int>(std::round(rawFps));
-                    // Anti-flicker: preserve current stable FPS if within ±1.25 frames
+                    // Anti-flicker: preserve current stable FPS if within ±1.25 frames (e.g. 119.8-120.2 -> 120)
                     if (m_stableFps > 0 && std::abs(rawFps - static_cast<float>(m_stableFps)) <= 1.25f) {
                         // Keep current stable FPS
                     } else {
@@ -885,6 +979,9 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 m_zeroFpsStreak++;
                 if (m_zeroFpsStreak >= 2) {
                     m_stableFps = 0;
+                    if (frames == 0) {
+                        g_activeGamePid.store(0, std::memory_order_relaxed);
+                    }
                 }
             }
         }

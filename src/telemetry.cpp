@@ -177,6 +177,12 @@ static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xA
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
 
+// High-Resolution ETW Frame Ring Buffer (512 slots)
+constexpr size_t ETW_FRAME_BUF_SIZE = 512;
+static uint64_t g_etwFrameTimestamps[ETW_FRAME_BUF_SIZE] = {};
+static std::atomic<uint32_t> g_etwFrameHead{0};
+static uint64_t g_qpcFreq = 0;
+
 static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
     if (!exeName || !*exeName) return false;
     static const wchar_t* const s_excluded[] = {
@@ -210,7 +216,7 @@ static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
 }
 
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
-    if (!pEvent || !g_pEtwFrameCounter) return;
+    if (!pEvent) return;
     DWORD pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == GetCurrentProcessId()) return;
 
@@ -222,10 +228,19 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
     if (excluded != 0 && pid == excluded) return;
 
-    // DXGI Present_Start is Event ID 42, D3D9 Present_Start is Event ID 1
+    // DXGI Present_Start: Event ID 42
+    // DXGI PresentMultiplaneOverlay_Start: Event ID 55 (modern Windows 10/11 MPO / Independent Flip)
+    // D3D9 Present_Start: Event ID 1
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
-    if (id == 42 || id == 1) {
-        g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
+    if (id == 42 || id == 55 || id == 1) {
+        uint64_t qpc = 0;
+        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&qpc));
+        uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
+        g_etwFrameTimestamps[head & (ETW_FRAME_BUF_SIZE - 1)] = qpc;
+        g_etwFrameHead.store(head + 1, std::memory_order_release);
+        if (g_pEtwFrameCounter) {
+            g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -254,7 +269,11 @@ TelemetryEngine::TelemetryEngine(bool verifyMockMode) {
         m_prevKernelTime = FileTimeToU64(kernel);
         m_prevUserTime = FileTimeToU64(user);
     }
-    m_lastFpsCalcTick = GetTickCount64();
+    if (g_qpcFreq == 0) {
+        LARGE_INTEGER freq = {};
+        QueryPerformanceFrequency(&freq);
+        g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
+    }
 }
 
 TelemetryEngine::~TelemetryEngine() {
@@ -764,44 +783,85 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     if (hwnd) {
         GetWindowThreadProcessId(hwnd, &fgPid);
     }
-    g_foregroundPid.store(fgPid, std::memory_order_relaxed);
 
-    wchar_t exeName[MAX_PATH] = {0};
-    bool hasExe = GetProcessExeName(fgPid, exeName, MAX_PATH);
-    bool isExcluded = hasExe && IsExcludedDesktopProcess(exeName);
-    if (isExcluded) {
-        g_excludedPid.store(fgPid, std::memory_order_relaxed);
-        g_isFgGameCandidate.store(false, std::memory_order_relaxed);
-    } else {
-        g_isFgGameCandidate.store(fgPid != 0 && fgPid != GetCurrentProcessId(), std::memory_order_relaxed);
-    }
+    DWORD currentSelfPid = GetCurrentProcessId();
 
-    uint64_t nowTick = GetTickCount64();
-    uint64_t elapsedMs = nowTick - m_lastFpsCalcTick;
-    float rawFps = 0.0f;
-    if (elapsedMs >= 350) {
-        uint32_t frames = m_etwFrameCount.exchange(0, std::memory_order_relaxed);
-        if (frames > 0 && elapsedMs > 0 && !isExcluded) {
-            rawFps = (float)((double)frames * 1000.0 / (double)elapsedMs);
+    // If active window is NOT our own notch overlay or settings window, update foreground tracking
+    if (fgPid != 0 && fgPid != currentSelfPid) {
+        DWORD oldFgPid = g_foregroundPid.load(std::memory_order_relaxed);
+        if (fgPid != oldFgPid) {
+            g_foregroundPid.store(fgPid, std::memory_order_relaxed);
+            // Reset frame ring buffer on window switch to prevent cross-app FPS pollution
+            g_etwFrameHead.store(0, std::memory_order_relaxed);
+            m_etwFrameCount.store(0, std::memory_order_relaxed);
+            m_lastTrackedPid = fgPid;
         }
-        m_lastFpsCalcTick = nowTick;
+
+        wchar_t exeName[MAX_PATH] = {0};
+        bool hasExe = GetProcessExeName(fgPid, exeName, MAX_PATH);
+        bool isExcluded = hasExe && IsExcludedDesktopProcess(exeName);
+        if (isExcluded) {
+            g_excludedPid.store(fgPid, std::memory_order_relaxed);
+            g_isFgGameCandidate.store(false, std::memory_order_relaxed);
+        } else {
+            g_excludedPid.store(0, std::memory_order_relaxed);
+            g_isFgGameCandidate.store(true, std::memory_order_relaxed);
+        }
     }
 
-    // Anti-Flicker & Hysteresis Smoothing:
-    // Requires 2 consecutive ticks to enter game FPS, 3 consecutive zero ticks to exit to desktop standby
-    if (rawFps >= 12.0f && !isExcluded) {
-        m_activeFpsStreak++;
+    DWORD activeFg = g_foregroundPid.load(std::memory_order_relaxed);
+    DWORD activeExcluded = g_excludedPid.load(std::memory_order_relaxed);
+    bool isCandidate = (activeFg != 0 && activeFg != activeExcluded && activeFg != currentSelfPid);
+
+    int calculatedFps = 0;
+    bool gameActive = false;
+
+    if (isCandidate && g_qpcFreq > 0) {
+        uint64_t nowQpc = 0;
+        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
+        uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
+
+        if (head > 0) {
+            uint64_t latestTs = g_etwFrameTimestamps[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
+
+            // If the latest present event was within the last 1.2 seconds, the game is actively presenting
+            if (nowQpc >= latestTs && (nowQpc - latestTs) <= (g_qpcFreq * 12 / 10)) {
+                // High-resolution sliding window of the last 600ms of presents
+                uint64_t windowLimit = (g_qpcFreq * 6) / 10; // 600 ms window
+                uint32_t count = 0;
+                uint64_t oldestTs = latestTs;
+
+                uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
+                for (uint32_t i = 0; i < maxScan; ++i) {
+                    uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
+                    uint64_t ts = g_etwFrameTimestamps[idx];
+                    if (ts == 0 || (latestTs - ts) > windowLimit) {
+                        break;
+                    }
+                    oldestTs = ts;
+                    count++;
+                }
+
+                if (count >= 2 && latestTs > oldestTs) {
+                    double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(g_qpcFreq);
+                    if (dtSec > 0.02) {
+                        double rawFps = static_cast<double>(count - 1) / dtSec;
+                        if (rawFps >= 10.0 && rawFps <= 1000.0) {
+                            calculatedFps = static_cast<int>(std::round(rawFps));
+                            gameActive = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (gameActive && calculatedFps > 0) {
+        m_stableFps = calculatedFps;
         m_zeroFpsStreak = 0;
-        if (m_activeFpsStreak >= 2) {
-            if (m_smoothedFps <= 0.0f) m_smoothedFps = rawFps;
-            else m_smoothedFps = m_smoothedFps * 0.55f + rawFps * 0.45f;
-            m_stableFps = (int)std::round(m_smoothedFps);
-        }
     } else {
-        m_activeFpsStreak = 0;
         m_zeroFpsStreak++;
-        if (m_zeroFpsStreak >= 3) {
-            m_smoothedFps = 0.0f;
+        if (m_zeroFpsStreak >= 2) {
             m_stableFps = 0;
         }
     }

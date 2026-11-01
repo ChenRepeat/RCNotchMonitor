@@ -146,14 +146,11 @@ private:
     HANDLE m_hJobObject = NULL;
     HANDLE m_hBridgeProcess = NULL;
 
-    // ETW FPS & Anti-Flicker state
+    // ETW FPS & High-Resolution Rolling Window state
     std::atomic<uint32_t> m_etwFrameCount{0};
-    uint64_t m_lastFpsCalcTick = 0;
-    int m_lastComputedFps = 0;
-    float m_smoothedFps = 0.0f;
+    DWORD m_lastTrackedPid = 0;
     int m_stableFps = 0;
     int m_zeroFpsStreak = 0;
-    int m_activeFpsStreak = 0;
 
     // Media & Audio state
     std::atomic<int> m_preferredSessionIdx{-1}; // -1 = auto-select Playing session

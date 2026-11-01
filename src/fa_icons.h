@@ -31,7 +31,8 @@ enum FaIconType {
     FA_ICON_STEP_FWD,
     FA_ICON_BACKWARD,
     FA_ICON_FORWARD,
-    FA_ICON_EXCHANGE
+    FA_ICON_EXCHANGE,
+    FA_ICON_DESKTOP
 };
 
 // Crisp Direct2D Vector Renderer for Font Awesome 6 Solid Icons
@@ -435,6 +436,18 @@ inline void DrawFaIcon(ID2D1Factory* factory, ID2D1RenderTarget* rt, FaIconType 
         rt->DrawLine(D2D1::Point2F(cx + w * 0.4f, y1 - r * 0.28f), D2D1::Point2F(cx + w, y1), brush, 1.4f);
         rt->DrawLine(D2D1::Point2F(cx - w, y2), D2D1::Point2F(cx + w, y2), brush, 1.4f);
         rt->DrawLine(D2D1::Point2F(cx - w * 0.4f, y2 + r * 0.28f), D2D1::Point2F(cx - w, y2), brush, 1.4f);
+        break;
+    }
+    case FA_ICON_DESKTOP: { // fa-desktop
+        float scrW = r * 0.85f;
+        float scrH = r * 0.58f;
+        float scrTop = cy - r * 0.68f;
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - scrW, scrTop, cx + scrW, scrTop + scrH), 1.6f, 1.6f), brush, 1.3f);
+        // Stand neck
+        rt->DrawLine(D2D1::Point2F(cx, scrTop + scrH), D2D1::Point2F(cx, cy + r * 0.48f), brush, 1.4f);
+        // Base plate
+        float baseW = r * 0.48f;
+        rt->DrawLine(D2D1::Point2F(cx - baseW, cy + r * 0.48f), D2D1::Point2F(cx + baseW, cy + r * 0.48f), brush, 1.5f);
         break;
     }
     }

@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include "config.h"
+#include "monitor_utils.h"
 
 struct UiHitZone {
     int id;

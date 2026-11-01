@@ -54,6 +54,10 @@ void AppConfig::ResetDefaults() {
     fpsIdleMode = 0;
     autoStartAdmin = false;
 
+    targetMonitor = 0;
+    targetMonitorDevice = L"";
+    positionOffsetPct = 50;
+
     mediaEnabled = true;
     mediaDockSide = 0; // 0 = Left, 1 = Right
     mediaTitleColor = RGB(248, 250, 252);
@@ -229,6 +233,10 @@ bool AppConfig::LoadFromFile(const std::wstring& path) {
     fpsIdleMode = std::clamp(ExtractJsonInt(json, L"fpsIdleMode", fpsIdleMode), 0, 1);
     autoStartAdmin = ExtractJsonBool(json, L"autoStartAdmin", autoStartAdmin);
 
+    targetMonitor = std::max(0, ExtractJsonInt(json, L"targetMonitor", targetMonitor));
+    targetMonitorDevice = ExtractJsonString(json, L"targetMonitorDevice", targetMonitorDevice);
+    positionOffsetPct = std::clamp(ExtractJsonInt(json, L"positionOffsetPct", positionOffsetPct), 0, 100);
+
     mediaEnabled = ExtractJsonBool(json, L"mediaEnabled", mediaEnabled);
     mediaDockSide = std::clamp(ExtractJsonInt(json, L"mediaDockSide", mediaDockSide), 0, 1);
     mediaTitleColor = HexToColor(ExtractJsonString(json, L"mediaTitleColor", ColorToHex(mediaTitleColor)), mediaTitleColor);
@@ -281,6 +289,9 @@ bool AppConfig::SaveToFile(const std::wstring& path) const {
     ss << L"  \"clickThroughLocked\": " << (clickThroughLocked ? L"true" : L"false") << L",\n";
     ss << L"  \"fpsIdleMode\": " << fpsIdleMode << L",\n";
     ss << L"  \"autoStartAdmin\": " << (autoStartAdmin ? L"true" : L"false") << L",\n";
+    ss << L"  \"targetMonitor\": " << targetMonitor << L",\n";
+    ss << L"  \"targetMonitorDevice\": \"" << targetMonitorDevice << L"\",\n";
+    ss << L"  \"positionOffsetPct\": " << positionOffsetPct << L",\n";
     ss << L"  \"mediaEnabled\": " << (mediaEnabled ? L"true" : L"false") << L",\n";
     ss << L"  \"mediaDockSide\": " << mediaDockSide << L",\n";
     ss << L"  \"mediaTitleColor\": \"" << ColorToHex(mediaTitleColor) << L"\",\n";

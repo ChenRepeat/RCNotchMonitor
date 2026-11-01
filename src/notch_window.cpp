@@ -155,12 +155,20 @@ bool NotchWindow::Create(HINSTANCE hInstance, AppConfig* config, TelemetryEngine
     QueryPerformanceCounter(&m_lastTick);
 
     float scale = m_config->GetEffectiveScale();
-    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    MonitorEntry mon = GetTargetMonitor(m_config->targetMonitor, m_config->targetMonitorDevice);
+    int monW = mon.rcMonitor.right - mon.rcMonitor.left;
+    int monLeft = mon.rcMonitor.left;
+    int monTop = mon.rcMonitor.top;
+
     int logW = (((int)std::ceil(m_currW) + 16 + 3) / 4) * 4;
     int logH = (((int)std::ceil(m_currH) + 3) / 4) * 4;
     int winW = (((int)std::round(logW * scale) + 2) / 4) * 4;
     int winH = (((int)std::round(logH * scale) + 2) / 4) * 4;
-    int posX = (scrW - winW) / 2;
+
+    int maxOffset = std::max(0, monW - winW);
+    float pct = std::clamp((float)m_config->positionOffsetPct / 100.0f, 0.0f, 1.0f);
+    int posX = monLeft + (int)std::round(pct * (float)maxOffset);
+    int posY = monTop;
 
     DWORD exStyle = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE;
     if (m_config->clickThroughLocked) {
@@ -172,7 +180,7 @@ bool NotchWindow::Create(HINSTANCE hInstance, AppConfig* config, TelemetryEngine
         wc.lpszClassName,
         L"RCNotchMonitor",
         WS_POPUP,
-        posX, 0, winW, winH,
+        posX, posY, winW, winH,
         NULL, NULL, hInstance, this
     );
 
@@ -258,6 +266,29 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_MOUSEMOVE: {
         if (m_config->clickThroughLocked) return 0;
+        if (GetCapture() == m_hwnd) {
+            POINT ptScreen;
+            GetCursorPos(&ptScreen);
+            int dx = ptScreen.x - m_dragStartX;
+            if (!m_isDragging && (std::abs(dx) > 4)) {
+                m_isDragging = true;
+            }
+            if (m_isDragging) {
+                SetCursor(LoadCursor(NULL, IDC_SIZEWE));
+                MonitorEntry mon = GetTargetMonitor(m_config->targetMonitor, m_config->targetMonitorDevice);
+                int monW = mon.rcMonitor.right - mon.rcMonitor.left;
+                int maxOffset = std::max(1, monW - m_canvasW);
+                float deltaPct = ((float)dx / (float)maxOffset) * 100.0f;
+                int newPct = std::clamp((int)std::round((float)m_dragStartOffsetPct + deltaPct), 0, 100);
+                if (newPct != m_config->positionOffsetPct) {
+                    m_config->positionOffsetPct = newPct;
+                    RenderAndPresent();
+                    if (onConfigChanged) onConfigChanged();
+                }
+                return 0;
+            }
+        }
+
         if (!m_trackingMouse) {
             TRACKMOUSEEVENT tme = {};
             tme.cbSize = sizeof(tme);
@@ -313,7 +344,7 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_MOUSELEAVE:
         m_trackingMouse = false;
-        if (m_isHovered) {
+        if (m_isHovered && !m_isDragging) {
             QueryPerformanceCounter(&m_lastTick);
             m_isHovered = false;
         }
@@ -365,6 +396,29 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             }
         }
+        // Prepare for top-edge dragging
+        if (!m_config->clickThroughLocked) {
+            POINT ptScreen;
+            GetCursorPos(&ptScreen);
+            m_isDragging = false;
+            m_dragStartX = ptScreen.x;
+            m_dragStartY = ptScreen.y;
+            m_dragStartOffsetPct = m_config->positionOffsetPct;
+            SetCapture(m_hwnd);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (GetCapture() == m_hwnd) {
+            ReleaseCapture();
+            if (m_isDragging) {
+                m_isDragging = false;
+                m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
+                if (onConfigChanged) onConfigChanged();
+                return 0;
+            }
+        }
         return 0;
     }
 
@@ -387,17 +441,20 @@ void NotchWindow::OnTimerTick() {
     m_lastTick = now;
     dt = std::clamp(dt, 0.001f, 0.050f);
 
-    if (m_isHovered && !m_config->clickThroughLocked) {
+    if (m_isHovered && !m_config->clickThroughLocked && !m_isDragging) {
         POINT pt;
         if (GetCursorPos(&pt)) {
+            RECT rcWin = {};
+            GetWindowRect(m_hwnd, &rcWin);
             float scale = m_config->GetEffectiveScale();
             float actualPhysW = (m_currW + 16.0f) * scale;
             float actualPhysH = m_currH * scale;
-            float scrCenterX = GetSystemMetrics(SM_CXSCREEN) * 0.5f;
-            float left = scrCenterX - actualPhysW * 0.5f - 6.0f;
-            float right = scrCenterX + actualPhysW * 0.5f + 6.0f;
-            float bottom = actualPhysH + 6.0f;
-            if (pt.x < (LONG)left || pt.x > (LONG)right || pt.y < 0 || pt.y > (LONG)bottom) {
+            float winCenterX = (rcWin.left + rcWin.right) * 0.5f;
+            float left = winCenterX - actualPhysW * 0.5f - 6.0f;
+            float right = winCenterX + actualPhysW * 0.5f + 6.0f;
+            float top = (float)rcWin.top - 4.0f;
+            float bottom = (float)rcWin.top + actualPhysH + 6.0f;
+            if (pt.x < (LONG)left || pt.x > (LONG)right || pt.y < (LONG)top || pt.y > (LONG)bottom) {
                 m_isHovered = false;
                 m_hoverButtonId = 0;
             }
@@ -1418,11 +1475,18 @@ void NotchWindow::RenderAndPresent() {
         RenderToTarget(m_dcRenderTarget, canvasLogW, drawW, drawH, m_animProgress, scale);
     }
 
-    int scrW = GetSystemMetrics(SM_CXSCREEN);
-    int posX = (scrW - m_canvasW) / 2;
+    MonitorEntry mon = GetTargetMonitor(m_config->targetMonitor, m_config->targetMonitorDevice);
+    int monW = mon.rcMonitor.right - mon.rcMonitor.left;
+    int monLeft = mon.rcMonitor.left;
+    int monTop = mon.rcMonitor.top;
+
+    int maxOffset = std::max(0, monW - m_canvasW);
+    float pct = std::clamp((float)m_config->positionOffsetPct / 100.0f, 0.0f, 1.0f);
+    int posX = monLeft + (int)std::round(pct * (float)maxOffset);
+    int posY = monTop;
 
     HDC hdcScreen = GetDC(NULL);
-    POINT ptDst = { posX, 0 };
+    POINT ptDst = { posX, posY };
     SIZE szWin = { m_canvasW, m_canvasH };
     POINT ptSrc = { 0, 0 };
     BLENDFUNCTION blend = {};

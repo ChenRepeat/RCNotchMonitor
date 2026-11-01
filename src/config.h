@@ -38,6 +38,11 @@ struct AppConfig {
     int fpsIdleMode = 0;           // 0 = Show "--", 1 = Show Monitor Hz
     bool autoStartAdmin = false;
 
+    // Display Monitor & Position Alignment
+    int targetMonitor = 0;                  // 0-based monitor index
+    std::wstring targetMonitorDevice = L""; // Device name e.g. \\.\DISPLAY1
+    int positionOffsetPct = 50;             // Top horizontal alignment: 0% = Left, 50% = Center (default), 100% = Right
+
     // Media Monitoring & Docked Block Configuration
     bool mediaEnabled = true;      // Enable GSMTC + CoreAudio Media Block
     int mediaDockSide = 0;         // 0 = Docked Left (靠左), 1 = Docked Right (靠右)

@@ -7,6 +7,7 @@
 #include "config.h"
 #include "telemetry.h"
 #include "fa_icons.h"
+#include "monitor_utils.h"
 
 class NotchWindow {
 public:
@@ -87,6 +88,12 @@ private:
     float m_audioBars[6] = { 0.18f, 0.28f, 0.22f, 0.16f, 0.24f, 0.18f };
     float m_currW = 260.0f;
     float m_currH = 36.0f;
+
+    // Interactive Dragging on Screen Top Edge
+    bool m_isDragging = false;
+    int m_dragStartX = 0;
+    int m_dragStartY = 0;
+    int m_dragStartOffsetPct = 50;
 
     // Interactive button rects in Expanded mode (in Notch local logical coordinates)
     D2D1_RECT_F m_btnSettingsRect = {};

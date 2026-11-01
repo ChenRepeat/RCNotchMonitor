@@ -1,0 +1,16 @@
+# Local portable compiler & dependencies
+deps/
+
+# Build outputs & object files
+dist/
+verify_out/
+src/*.o
+*.exe
+*.bmp
+*.pdb
+
+# IDE & OS files
+.vs/
+.vscode/
+Thumbs.db
+.DS_Store

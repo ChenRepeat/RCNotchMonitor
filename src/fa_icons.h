@@ -23,7 +23,15 @@ enum FaIconType {
     FA_ICON_MINUS,
     FA_ICON_XMARK,
     FA_ICON_LOGO,
-    FA_ICON_GRIP
+    FA_ICON_GRIP,
+    FA_ICON_MUSIC,
+    FA_ICON_PLAY,
+    FA_ICON_PAUSE,
+    FA_ICON_STEP_BACK,
+    FA_ICON_STEP_FWD,
+    FA_ICON_BACKWARD,
+    FA_ICON_FORWARD,
+    FA_ICON_EXCHANGE
 };
 
 // Crisp Direct2D Vector Renderer for Font Awesome 6 Solid Icons
@@ -283,6 +291,150 @@ inline void DrawFaIcon(ID2D1Factory* factory, ID2D1RenderTarget* rt, FaIconType 
             rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx - dx, cy + row * dy), dotR, dotR), brush);
             rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx + dx, cy + row * dy), dotR, dotR), brush);
         }
+        break;
+    }
+    case FA_ICON_MUSIC: { // fa-music (beamed eighth notes)
+        float xL = cx - r * 0.38f;
+        float xR = cx + r * 0.42f;
+        float yTopL = cy - r * 0.58f;
+        float yTopR = cy - r * 0.76f;
+        float yBotL = cy + r * 0.48f;
+        float yBotR = cy + r * 0.32f;
+        float headR = r * 0.24f;
+        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(xL - headR * 0.5f, yBotL), headR, headR * 0.80f), brush);
+        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(xR - headR * 0.5f, yBotR), headR, headR * 0.80f), brush);
+        rt->DrawLine(D2D1::Point2F(xL + headR * 0.25f, yBotL), D2D1::Point2F(xL + headR * 0.25f, yTopL), brush, 1.5f);
+        rt->DrawLine(D2D1::Point2F(xR + headR * 0.25f, yBotR), D2D1::Point2F(xR + headR * 0.25f, yTopR), brush, 1.5f);
+        rt->DrawLine(D2D1::Point2F(xL + headR * 0.25f, yTopL), D2D1::Point2F(xR + headR * 0.25f, yTopR), brush, 2.2f);
+        break;
+    }
+    case FA_ICON_PLAY: { // fa-play (solid right-pointing triangle)
+        if (factory) {
+            ID2D1PathGeometry* path = nullptr;
+            if (SUCCEEDED(factory->CreatePathGeometry(&path)) && path) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(path->Open(&sink))) {
+                    sink->BeginFigure(D2D1::Point2F(cx - r * 0.48f, cy - r * 0.68f), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx + r * 0.68f, cy));
+                    sink->AddLine(D2D1::Point2F(cx - r * 0.48f, cy + r * 0.68f));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                }
+                rt->FillGeometry(path, brush);
+                path->Release();
+            }
+        }
+        break;
+    }
+    case FA_ICON_PAUSE: { // fa-pause (two vertical bars)
+        float bw = r * 0.26f;
+        float bh = r * 0.68f;
+        float off = r * 0.36f;
+        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - off - bw * 0.5f, cy - bh, cx - off + bw * 0.5f, cy + bh), 1.2f, 1.2f), brush);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx + off - bw * 0.5f, cy - bh, cx + off + bw * 0.5f, cy + bh), 1.2f, 1.2f), brush);
+        break;
+    }
+    case FA_ICON_STEP_BACK: { // fa-backward-step (bar + left triangle)
+        float bh = r * 0.64f;
+        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx - r * 0.68f, cy - bh, cx - r * 0.44f, cy + bh), 1.0f, 1.0f), brush);
+        if (factory) {
+            ID2D1PathGeometry* path = nullptr;
+            if (SUCCEEDED(factory->CreatePathGeometry(&path)) && path) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(path->Open(&sink))) {
+                    sink->BeginFigure(D2D1::Point2F(cx + r * 0.64f, cy - bh), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx - r * 0.38f, cy));
+                    sink->AddLine(D2D1::Point2F(cx + r * 0.64f, cy + bh));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                }
+                rt->FillGeometry(path, brush);
+                path->Release();
+            }
+        }
+        break;
+    }
+    case FA_ICON_STEP_FWD: { // fa-forward-step (right triangle + bar)
+        float bh = r * 0.64f;
+        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx + r * 0.44f, cy - bh, cx + r * 0.68f, cy + bh), 1.0f, 1.0f), brush);
+        if (factory) {
+            ID2D1PathGeometry* path = nullptr;
+            if (SUCCEEDED(factory->CreatePathGeometry(&path)) && path) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(path->Open(&sink))) {
+                    sink->BeginFigure(D2D1::Point2F(cx - r * 0.64f, cy - bh), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx + r * 0.38f, cy));
+                    sink->AddLine(D2D1::Point2F(cx - r * 0.64f, cy + bh));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                }
+                rt->FillGeometry(path, brush);
+                path->Release();
+            }
+        }
+        break;
+    }
+    case FA_ICON_BACKWARD: { // fa-backward (double left triangles for -10s seek)
+        float bh = r * 0.58f;
+        if (factory) {
+            ID2D1PathGeometry* path = nullptr;
+            if (SUCCEEDED(factory->CreatePathGeometry(&path)) && path) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(path->Open(&sink))) {
+                    sink->BeginFigure(D2D1::Point2F(cx - r * 0.02f, cy - bh), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx - r * 0.76f, cy));
+                    sink->AddLine(D2D1::Point2F(cx - r * 0.02f, cy + bh));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+                    sink->BeginFigure(D2D1::Point2F(cx + r * 0.74f, cy - bh), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx, cy));
+                    sink->AddLine(D2D1::Point2F(cx + r * 0.74f, cy + bh));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                }
+                rt->FillGeometry(path, brush);
+                path->Release();
+            }
+        }
+        break;
+    }
+    case FA_ICON_FORWARD: { // fa-forward (double right triangles for +10s seek)
+        float bh = r * 0.58f;
+        if (factory) {
+            ID2D1PathGeometry* path = nullptr;
+            if (SUCCEEDED(factory->CreatePathGeometry(&path)) && path) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(path->Open(&sink))) {
+                    sink->BeginFigure(D2D1::Point2F(cx - r * 0.74f, cy - bh), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx, cy));
+                    sink->AddLine(D2D1::Point2F(cx - r * 0.74f, cy + bh));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+                    sink->BeginFigure(D2D1::Point2F(cx + r * 0.02f, cy - bh), D2D1_FIGURE_BEGIN_FILLED);
+                    sink->AddLine(D2D1::Point2F(cx + r * 0.76f, cy));
+                    sink->AddLine(D2D1::Point2F(cx + r * 0.02f, cy + bh));
+                    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+                    sink->Close();
+                    sink->Release();
+                }
+                rt->FillGeometry(path, brush);
+                path->Release();
+            }
+        }
+        break;
+    }
+    case FA_ICON_EXCHANGE: { // fa-arrows-rotate / switch source
+        float w = r * 0.62f;
+        float y1 = cy - r * 0.28f;
+        float y2 = cy + r * 0.28f;
+        rt->DrawLine(D2D1::Point2F(cx - w, y1), D2D1::Point2F(cx + w, y1), brush, 1.4f);
+        rt->DrawLine(D2D1::Point2F(cx + w * 0.4f, y1 - r * 0.28f), D2D1::Point2F(cx + w, y1), brush, 1.4f);
+        rt->DrawLine(D2D1::Point2F(cx - w, y2), D2D1::Point2F(cx + w, y2), brush, 1.4f);
+        rt->DrawLine(D2D1::Point2F(cx - w * 0.4f, y2 + r * 0.28f), D2D1::Point2F(cx - w, y2), brush, 1.4f);
         break;
     }
     }

@@ -12,13 +12,13 @@ struct MetricConfig {
 };
 
 struct AppConfig {
-    int configVersion = 4;
-    int uiScalePct = 100;          // 60% ~ 200% multiplier on top of auto resolution scale
+    int configVersion = 5;
+    int uiScalePct = 100;          // 60% ~ 220% multiplier on top of auto resolution scale
     int notchWidth = 260;          // Base logical width for Dual-Row (Single-Row auto-expands width)
     int notchHeight = 36;          // Base logical height
-    int expandedWidth = 420;       // Dynamic island logical expanded width
-    int expandedHeight = 188;      // Dynamic island logical expanded height
-    int cornerRadius = 16;         // Bottom corner radius
+    int expandedWidth = 420;       // Dynamic island logical expanded width (without media panel)
+    int expandedHeight = 176;      // Dynamic island logical expanded height (2.0 line-height header + symmetric padding)
+    int cornerRadius = 24;         // Corner radius (expanded concentric: R_outer - pad = R_card)
     int layoutMode = 0;            // 0 = Dual Row (2x2), 1 = Single Row (1x4)
     int refreshIntervalMs = 500;   // 250 ~ 2000 ms
     int fontSize = 11;             // 8 ~ 18 pt
@@ -37,6 +37,12 @@ struct AppConfig {
     bool clickThroughLocked = false;
     int fpsIdleMode = 0;           // 0 = Show "--", 1 = Show Monitor Hz
     bool autoStartAdmin = false;
+
+    // Media Monitoring & Docked Block Configuration
+    bool mediaEnabled = true;      // Enable GSMTC + CoreAudio Media Block
+    int mediaDockSide = 0;         // 0 = Docked Left (靠左), 1 = Docked Right (靠右)
+    COLORREF mediaTitleColor = RGB(248, 250, 252); // #F8FAFC (Track title marquee color)
+    COLORREF mediaWaveColor = RGB(74, 222, 128);   // #4ADE80 (Audio peak visualizer color)
 
     // 0: CPU, 1: GPU, 2: RAM, 3: FPS
     MetricConfig metrics[4];

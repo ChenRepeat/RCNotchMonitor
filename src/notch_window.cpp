@@ -102,6 +102,7 @@ void NotchWindow::EnsureCanvas(int reqW, int reqH) {
 
 void NotchWindow::CleanupD2D() {
     FreeCanvas();
+    if (m_albumBitmap) { m_albumBitmap->Release(); m_albumBitmap = nullptr; }
     if (m_dcRenderTarget) { m_dcRenderTarget->Release(); m_dcRenderTarget = nullptr; }
     if (m_dwriteFactory) { m_dwriteFactory->Release(); m_dwriteFactory = nullptr; }
     if (m_d2dFactory) { m_d2dFactory->Release(); m_d2dFactory = nullptr; }
@@ -138,8 +139,19 @@ bool NotchWindow::Create(HINSTANCE hInstance, AppConfig* config, TelemetryEngine
     RegisterClassExW(&wc);
 
     m_layoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
-    m_currW = m_config->GetCollapsedLogicalWidth();
-    m_currH = m_config->GetCollapsedLogicalHeight();
+    m_mediaDockAnim = (m_config->mediaDockSide == 1) ? 1.0f : 0.0f;
+    bool hasMed = false;
+    if (m_telemetry && m_config->mediaEnabled) {
+        hasMed = m_telemetry->GetSnapshot().hasMediaSession;
+    }
+    m_mediaAnim = hasMed ? 1.0f : 0.0f;
+
+    float wDual = 260.0f, hDual = 36.0f, wSingle = 396.0f, hSingle = 28.0f;
+    GetDualAndSingleLogicalSize(m_config, wDual, hDual, wSingle, hSingle);
+    float easeLayout = Smoothstep01(m_layoutAnim);
+    float medExtra = (160.0f + 16.0f * easeLayout) * Smoothstep01(m_mediaAnim);
+    m_currW = wDual + (wSingle - wDual) * easeLayout + medExtra;
+    m_currH = hDual + (hSingle - hDual) * easeLayout;
     QueryPerformanceCounter(&m_lastTick);
 
     float scale = m_config->GetEffectiveScale();
@@ -187,7 +199,6 @@ void NotchWindow::Destroy() {
 void NotchWindow::ApplyConfig() {
     if (!m_hwnd || !m_config) return;
     SetClickThrough(m_config->clickThroughLocked);
-    // Do NOT snap m_currW / m_currH or m_layoutAnim here so OnTimerTick() smoothly tweens any layout/size change!
     QueryPerformanceCounter(&m_lastTick);
     KillTimer(m_hwnd, TIMER_DATA_ID);
     SetTimer(m_hwnd, TIMER_DATA_ID, m_config->refreshIntervalMs, NULL);
@@ -271,8 +282,16 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         m_hoverButtonId = 0;
         if (m_animProgress > 0.65f) {
             if (PointInRectF(mx, my, m_btnSettingsRect)) m_hoverButtonId = 1;
-            else if (PointInRectF(mx, my, m_btnLayoutRect)) m_hoverButtonId = 2;
             else if (PointInRectF(mx, my, m_btnLockRect)) m_hoverButtonId = 3;
+            else if (m_mediaAnim > 0.5f) {
+                if (PointInRectF(mx, my, m_btnMediaSwitchRect)) m_hoverButtonId = 10;
+                else if (PointInRectF(mx, my, m_btnMediaPrevRect)) m_hoverButtonId = 11;
+                else if (PointInRectF(mx, my, m_btnMediaRewRect)) m_hoverButtonId = 12;
+                else if (PointInRectF(mx, my, m_btnMediaPlayRect)) m_hoverButtonId = 13;
+                else if (PointInRectF(mx, my, m_btnMediaFfwdRect)) m_hoverButtonId = 14;
+                else if (PointInRectF(mx, my, m_btnMediaNextRect)) m_hoverButtonId = 15;
+                else if (PointInRectF(mx, my, m_rectMediaSeekBar)) m_hoverButtonId = 16;
+            }
         }
         SetCursor(LoadCursor(NULL, m_hoverButtonId > 0 ? IDC_HAND : IDC_ARROW));
         if (oldBtn != m_hoverButtonId) {
@@ -313,19 +332,37 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             if (PointInRectF(mx, my, m_btnSettingsRect)) {
                 if (onOpenSettings) onOpenSettings();
                 return 0;
-            } else if (PointInRectF(mx, my, m_btnLayoutRect)) {
-                QueryPerformanceCounter(&m_lastTick);
-                m_config->layoutMode = (m_config->layoutMode == 0) ? 1 : 0;
-                m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
-                if (onConfigChanged) onConfigChanged();
-                RenderAndPresent();
-                return 0;
             } else if (PointInRectF(mx, my, m_btnLockRect)) {
                 SetClickThrough(true);
                 m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
                 if (onConfigChanged) onConfigChanged();
                 RenderAndPresent();
                 return 0;
+            } else if (m_mediaAnim > 0.5f && m_telemetry) {
+                if (PointInRectF(mx, my, m_btnMediaSwitchRect)) {
+                    m_telemetry->MediaCycleSession();
+                    return 0;
+                } else if (PointInRectF(mx, my, m_btnMediaPrevRect)) {
+                    m_telemetry->MediaPrevTrack();
+                    return 0;
+                } else if (PointInRectF(mx, my, m_btnMediaRewRect)) {
+                    m_telemetry->MediaSeekRelative(-10);
+                    return 0;
+                } else if (PointInRectF(mx, my, m_btnMediaPlayRect)) {
+                    m_telemetry->MediaPlayPause();
+                    return 0;
+                } else if (PointInRectF(mx, my, m_btnMediaFfwdRect)) {
+                    m_telemetry->MediaSeekRelative(+10);
+                    return 0;
+                } else if (PointInRectF(mx, my, m_btnMediaNextRect)) {
+                    m_telemetry->MediaNextTrack();
+                    return 0;
+                } else if (PointInRectF(mx, my, m_rectMediaSeekBar)) {
+                    float barW = std::max(1.0f, m_rectMediaSeekBar.right - m_rectMediaSeekBar.left);
+                    float ratio = std::clamp((mx - m_rectMediaSeekBar.left) / barW, 0.0f, 1.0f);
+                    m_telemetry->MediaSeekToRatio(ratio);
+                    return 0;
+                }
             }
         }
         return 0;
@@ -367,54 +404,86 @@ void NotchWindow::OnTimerTick() {
         }
     }
 
+    TelemetrySnapshot snap;
+    if (m_telemetry) {
+        snap = m_telemetry->GetSnapshot();
+    }
+
     float targetProgress = (m_isHovered && !m_config->clickThroughLocked) ? 1.0f : 0.0f;
     float targetLayoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
+    float targetMediaAnim = (m_config->mediaEnabled && snap.hasMediaSession) ? 1.0f : 0.0f;
+    float targetDockAnim = (m_config->mediaDockSide == 1) ? 1.0f : 0.0f;
 
     bool changed = false;
 
-    // 1. Advance Expand/Collapse progress (0.22s duration -> ~28 frames at 120Hz, shaped by Smoothstep01)
-    if (std::fabs(m_animProgress - targetProgress) > 0.002f) {
-        float step = dt / 0.22f;
-        if (m_animProgress < targetProgress)
-            m_animProgress = std::min(targetProgress, m_animProgress + step);
-        else
-            m_animProgress = std::max(targetProgress, m_animProgress - step);
-        changed = true;
-    } else if (m_animProgress != targetProgress) {
-        m_animProgress = targetProgress;
-        changed = true;
+    auto stepLinear = [&](float& val, float target, float durationSec) {
+        if (std::fabs(val - target) > 0.002f) {
+            float step = dt / durationSec;
+            if (val < target) val = std::min(target, val + step);
+            else val = std::max(target, val - step);
+            changed = true;
+        } else if (val != target) {
+            val = target;
+            changed = true;
+        }
+    };
+
+    stepLinear(m_animProgress, targetProgress, 0.22f);
+    stepLinear(m_layoutAnim, targetLayoutAnim, 0.26f);
+    stepLinear(m_mediaAnim, targetMediaAnim, 0.26f);
+    stepLinear(m_mediaDockAnim, targetDockAnim, 0.26f);
+
+    // Advance marquee & audio visualizer bars when media is visible
+    if (m_mediaAnim > 0.01f) {
+        m_marqueePhase += dt * 36.0f; // 36 logical px/sec smooth marquee scroll
+        if (m_marqueePhase > 10000.0f) m_marqueePhase -= 10000.0f;
+        m_marqueeOffset = m_marqueePhase;
+
+        float rawPeak = m_telemetry ? m_telemetry->PollAudioPeakFast() : snap.audioPeak;
+        if (snap.mediaIsPlaying && rawPeak < 0.08f) {
+            // Subtle breathing pulse when playing at low/muted volume
+            rawPeak = 0.28f + 0.18f * std::sin(m_marqueePhase * 0.20f);
+        }
+        const float freqs[4] = { 0.19f, 0.31f, 0.25f, 0.37f };
+        const float phases[4] = { 0.0f, 1.4f, 2.7f, 4.1f };
+        float barAlpha = 1.0f - std::exp(-20.0f * dt);
+        for (int b = 0; b < 4; ++b) {
+            float wave = 0.55f + 0.45f * std::sin(m_marqueePhase * freqs[b] + phases[b]);
+            float targetBar = snap.mediaIsPlaying
+                ? std::clamp(0.14f + rawPeak * wave * 1.15f, 0.14f, 1.0f)
+                : 0.14f;
+            if (std::fabs(m_audioBars[b] - targetBar) > 0.01f) {
+                m_audioBars[b] += (targetBar - m_audioBars[b]) * barAlpha;
+                changed = true;
+            }
+        }
+        // Keep redrawing smoothly for marquee scroll while playing
+        if (snap.mediaIsPlaying) {
+            changed = true;
+        }
     }
 
-    // 2. Advance Single-Row <-> Dual-Row progress (0.26s duration -> ~32 frames at 120Hz, shaped by Smoothstep01)
-    if (std::fabs(m_layoutAnim - targetLayoutAnim) > 0.002f) {
-        float step = dt / 0.26f;
-        if (m_layoutAnim < targetLayoutAnim)
-            m_layoutAnim = std::min(targetLayoutAnim, m_layoutAnim + step);
-        else
-            m_layoutAnim = std::max(targetLayoutAnim, m_layoutAnim - step);
-        changed = true;
-    } else if (m_layoutAnim != targetLayoutAnim) {
-        m_layoutAnim = targetLayoutAnim;
-        changed = true;
-    }
-
-    // 3. Compute exact target width & height from Smoothstep(m_layoutAnim) and Smoothstep(m_animProgress)
     float wDual = 260.0f, hDual = 36.0f, wSingle = 396.0f, hSingle = 28.0f;
     GetDualAndSingleLogicalSize(m_config, wDual, hDual, wSingle, hSingle);
 
     float easeLayout = Smoothstep01(m_layoutAnim);
     float easeExpand = Smoothstep01(m_animProgress);
+    float easeMedia  = Smoothstep01(m_mediaAnim);
 
-    float collapsedW = wDual + (wSingle - wDual) * easeLayout;
+    float medCollapsedW = (160.0f + 16.0f * easeLayout) * easeMedia;
+    float collapsedW = wDual + (wSingle - wDual) * easeLayout + medCollapsedW;
     float collapsedH = hDual + (hSingle - hDual) * easeLayout;
 
-    float desiredW = collapsedW + ((float)m_config->expandedWidth - collapsedW) * easeExpand;
-    float desiredH = collapsedH + ((float)m_config->expandedHeight - collapsedH) * easeExpand;
+    float expW = (float)m_config->expandedWidth + 208.0f * easeMedia;
+    float expH = (float)m_config->expandedHeight;
+
+    float desiredW = collapsedW + (expW - collapsedW) * easeExpand;
+    float desiredH = collapsedH + (expH - collapsedH) * easeExpand;
 
     if (std::fabs(m_currW - desiredW) > 0.05f || std::fabs(m_currH - desiredH) > 0.05f) {
-        // When m_animProgress or m_layoutAnim is actively driving the transition, follow desiredW/H directly;
-        // if user adjusted base width/height sliders, smooth with exponential decay:
-        if (std::fabs(m_animProgress - targetProgress) > 0.001f || std::fabs(m_layoutAnim - targetLayoutAnim) > 0.001f) {
+        if (std::fabs(m_animProgress - targetProgress) > 0.001f ||
+            std::fabs(m_layoutAnim - targetLayoutAnim) > 0.001f ||
+            std::fabs(m_mediaAnim - targetMediaAnim) > 0.001f) {
             m_currW = desiredW;
             m_currH = desiredH;
         } else {
@@ -432,6 +501,80 @@ void NotchWindow::OnTimerTick() {
     if (changed) {
         RenderAndPresent();
     }
+}
+
+void NotchWindow::UpdateAlbumArtBitmap(ID2D1RenderTarget* rt, const TelemetrySnapshot& snap) {
+    if (!rt || !snap.hasAlbumArt || snap.albumArtBgra.empty() || snap.albumArtW <= 0 || snap.albumArtH <= 0) return;
+    if (m_albumBitmap && m_albumBitmapVer == snap.albumArtVer) return;
+
+    if (m_albumBitmap) {
+        m_albumBitmap->Release();
+        m_albumBitmap = nullptr;
+    }
+
+    D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f, 96.0f
+    );
+    if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU((UINT32)snap.albumArtW, (UINT32)snap.albumArtH),
+                                   snap.albumArtBgra.data(), (UINT32)(snap.albumArtW * 4), &bp, &m_albumBitmap))) {
+        m_albumBitmapVer = snap.albumArtVer;
+        m_albumBitmapW = snap.albumArtW;
+        m_albumBitmapH = snap.albumArtH;
+    }
+}
+
+void NotchWindow::DrawRoundedAlbumArt(ID2D1RenderTarget* rt, const D2D1_RECT_F& rc, float radius, float alpha) {
+    if (!rt) return;
+    float w = rc.right - rc.left;
+    float h = rc.bottom - rc.top;
+    if (w <= 1.0f || h <= 1.0f) return;
+
+    if (m_albumBitmap) {
+        ID2D1BitmapBrush* bmpBrush = nullptr;
+        D2D1_BITMAP_BRUSH_PROPERTIES bbp = D2D1::BitmapBrushProperties(
+            D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+        );
+        if (SUCCEEDED(rt->CreateBitmapBrush(m_albumBitmap, bbp, &bmpBrush)) && bmpBrush) {
+            float sx = w / std::max(1.0f, (float)m_albumBitmapW);
+            float sy = h / std::max(1.0f, (float)m_albumBitmapH);
+            bmpBrush->SetTransform(
+                D2D1::Matrix3x2F::Scale(sx, sy) *
+                D2D1::Matrix3x2F::Translation(rc.left, rc.top)
+            );
+            bmpBrush->SetOpacity(alpha);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rc, radius, radius), bmpBrush);
+            bmpBrush->Release();
+            return;
+        }
+    }
+
+    // Fallback icon box
+    ID2D1SolidColorBrush* brBg = nullptr;
+    ID2D1SolidColorBrush* brFg = nullptr;
+    rt->CreateSolidColorBrush(D2D1::ColorF(0.16f, 0.18f, 0.24f, alpha), &brBg);
+    rt->CreateSolidColorBrush(ColorRefToD2D(m_config ? m_config->mediaWaveColor : RGB(74, 222, 128), alpha), &brFg);
+    if (brBg) rt->FillRoundedRectangle(D2D1::RoundedRect(rc, radius, radius), brBg);
+    if (brFg) DrawFaIcon(rt, FA_ICON_MUSIC, (rc.left + rc.right) * 0.5f, (rc.top + rc.bottom) * 0.5f, w * 0.58f, brFg);
+    if (brBg) brBg->Release();
+    if (brFg) brFg->Release();
+}
+
+void NotchWindow::DrawAudioVisualizer(ID2D1RenderTarget* rt, float x, float cy, float w, float maxH, D2D1_COLOR_F col) {
+    ID2D1SolidColorBrush* br = nullptr;
+    rt->CreateSolidColorBrush(col, &br);
+    if (!br) return;
+
+    const int nBars = 4;
+    float barW = 2.4f;
+    float gap = (w - nBars * barW) / (float)(nBars - 1);
+    for (int i = 0; i < nBars; ++i) {
+        float bh = std::clamp(m_audioBars[i], 0.14f, 1.0f) * maxH;
+        float bx = x + i * (barW + gap);
+        D2D1_RECT_F rcBar = D2D1::RectF(bx, cy - bh * 0.5f, bx + barW, cy + bh * 0.5f);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(rcBar, 1.2f, 1.2f), br);
+    }
+    br->Release();
 }
 
 void NotchWindow::DrawFaIcon(ID2D1RenderTarget* rt, FaIconType icon, float cx, float cy, float size, ID2D1Brush* brush) {
@@ -498,7 +641,7 @@ static float MeasureTextWidth(IDWriteFactory* dwFactory, IDWriteTextFormat* fmt,
     if (text.empty()) return 0.0f;
     IDWriteTextLayout* layout = nullptr;
     float w = 0.0f;
-    if (SUCCEEDED(dwFactory->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt, 500.0f, 50.0f, &layout))) {
+    if (SUCCEEDED(dwFactory->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt, 1000.0f, 50.0f, &layout))) {
         DWRITE_TEXT_METRICS tm = {};
         if (SUCCEEDED(layout->GetMetrics(&tm))) {
             w = tm.widthIncludingTrailingWhitespace;
@@ -508,10 +651,40 @@ static float MeasureTextWidth(IDWriteFactory* dwFactory, IDWriteTextFormat* fmt,
     return w;
 }
 
+static void DrawMarqueeText(ID2D1RenderTarget* rt, IDWriteFactory* dwFactory, IDWriteTextFormat* fmt,
+                            const std::wstring& text, const D2D1_RECT_F& clipRect, ID2D1Brush* brush, float scrollOffset) {
+    if (text.empty() || !rt || !fmt || !brush) return;
+    float boxW = clipRect.right - clipRect.left;
+    if (boxW <= 4.0f) return;
+
+    float textW = MeasureTextWidth(dwFactory, fmt, text);
+    rt->PushAxisAlignedClip(clipRect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    if (textW <= boxW) {
+        rt->DrawText(text.c_str(), (UINT32)text.size(), fmt, clipRect, brush);
+    } else {
+        float gap = 28.0f;
+        float cycle = textW + gap;
+        float shift = std::fmod(scrollOffset, cycle);
+        float x1 = clipRect.left - shift;
+        D2D1_RECT_F rc1 = D2D1::RectF(x1, clipRect.top, x1 + textW + 4.0f, clipRect.bottom);
+        rt->DrawText(text.c_str(), (UINT32)text.size(), fmt, rc1, brush);
+
+        if (x1 + textW + gap < clipRect.right) {
+            float x2 = x1 + cycle;
+            D2D1_RECT_F rc2 = D2D1::RectF(x2, clipRect.top, x2 + textW + 4.0f, clipRect.bottom);
+            rt->DrawText(text.c_str(), (UINT32)text.size(), fmt, rc2, brush);
+        }
+    }
+
+    rt->PopAxisAlignedClip();
+}
+
 void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, float alpha) {
     if (alpha <= 0.02f || !m_config || !m_telemetry) return;
 
     TelemetrySnapshot snap = m_telemetry->GetSnapshot();
+    UpdateAlbumArtBitmap(rt, snap);
 
     std::vector<int> activeItems;
     for (int i = 0; i < 4; ++i) {
@@ -520,12 +693,104 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
             activeItems.push_back(idx);
         }
     }
-    if (activeItems.empty()) return;
 
     int count = (int)activeItems.size();
-    // Smooth interpolation factor between Dual-Row (0.0) and Single-Row (1.0)
     float layoutT = (count <= 2) ? 1.0f : Smoothstep01(m_layoutAnim);
+    float easeMedia = Smoothstep01(m_mediaAnim);
+    float easeDock  = Smoothstep01(m_mediaDockAnim); // 0.0 = Left, 1.0 = Right
 
+    float padX = 20.0f;
+    float innerH = h - 4.0f;
+    float medAllocatedW = (160.0f + 16.0f * layoutT) * easeMedia;
+
+    // Determine horizontal sub-regions for Hardware Block and Media Block
+    float totalInnerW = std::max(40.0f, w - padX * 2.0f);
+    float hwRegionW = std::max(40.0f, totalInnerW - medAllocatedW);
+    // When easeDock == 0 (Media Left): hwStartX = padX + medAllocatedW; when easeDock == 1 (Media Right): hwStartX = padX
+    float hwStartX = padX + medAllocatedW * (1.0f - easeDock);
+
+    // ==================== 1. Draw Collapsed Media Block (Source Art + Marquee + Audio Peak) ====================
+    if (easeMedia > 0.02f && !snap.mediaTitle.empty()) {
+        float medAlpha = alpha * easeMedia;
+        float medBoxW = 132.0f + 8.0f * layoutT;
+        float medX_Left  = padX;
+        float medX_Right = w - padX - medBoxW;
+        float medX = medX_Left + (medX_Right - medX_Left) * easeDock;
+
+        // Generous, balanced section gap between Media and Monitoring regions (centered divider)
+        float divX_Left  = (medX_Left + medBoxW + padX + medAllocatedW) * 0.5f;
+        float divX_Right = (padX + hwRegionW + medX_Right) * 0.5f;
+        float divX = divX_Left + (divX_Right - divX_Left) * easeDock;
+
+        ID2D1SolidColorBrush* brDiv = nullptr;
+        rt->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f * medAlpha), &brDiv);
+        if (brDiv) {
+            rt->DrawLine(D2D1::Point2F(divX, 5.0f), D2D1::Point2F(divX, h - 7.0f), brDiv, 1.0f);
+            brDiv->Release();
+        }
+
+        // Interpolate Album Art size between Dual-Row (24x24 spanning both rows) and Single-Row (18x18)
+        float artSize = 22.0f - 4.0f * layoutT;
+        float artY = 1.0f + (innerH - artSize) * 0.5f;
+        D2D1_RECT_F rcArt = D2D1::RectF(medX, artY, medX + artSize, artY + artSize);
+        DrawRoundedAlbumArt(rt, rcArt, 4.0f, medAlpha);
+
+        IDWriteTextFormat* fmtMedTitle = nullptr;
+        IDWriteTextFormat* fmtMedSub = nullptr;
+        m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10.2f - 0.4f * layoutT, L"zh-TW", &fmtMedTitle);
+        m_dwriteFactory->CreateTextFormat(L"Segoe UI Semibold", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 8.8f, L"zh-TW", &fmtMedSub);
+        if (fmtMedTitle && fmtMedSub) {
+            fmtMedTitle->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            fmtMedTitle->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            fmtMedSub->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            fmtMedSub->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            ID2D1SolidColorBrush* brMedTitle = nullptr;
+            ID2D1SolidColorBrush* brMedSub = nullptr;
+            rt->CreateSolidColorBrush(ColorRefToD2D(m_config->mediaTitleColor, medAlpha), &brMedTitle);
+            rt->CreateSolidColorBrush(D2D1::ColorF(0.62f, 0.68f, 0.78f, medAlpha * (1.0f - layoutT)), &brMedSub);
+
+            float textLeft = medX + artSize + 6.0f;
+            float waveW = 14.0f;
+
+            // Dual-Row: Top line = full-width Marquee, Bottom line = Source Name + Audio Peak Bars
+            // Single-Row: Single line = Marquee on left + Audio Peak Bars on right
+            float marqueeRight = (medX + medBoxW) - (waveW + 4.0f) * layoutT;
+            float marqueeTop = 1.0f;
+            float marqueeBot = 1.0f + innerH * (0.54f + 0.46f * layoutT);
+
+            std::wstring fullTrack = snap.mediaTitle;
+            if (!snap.mediaArtist.empty() && fullTrack.find(snap.mediaArtist) == std::wstring::npos) {
+                fullTrack += L" — " + snap.mediaArtist;
+            }
+            DrawMarqueeText(rt, m_dwriteFactory, fmtMedTitle, fullTrack,
+                            D2D1::RectF(textLeft, marqueeTop, marqueeRight, marqueeBot),
+                            brMedTitle, m_marqueeOffset);
+
+            // In Dual-Row mode, draw source label on bottom-left of media block
+            if (layoutT < 0.85f && brMedSub) {
+                D2D1_RECT_F rcSrc = D2D1::RectF(textLeft, 1.0f + innerH * 0.50f, medX + medBoxW - waveW - 2.0f, 1.0f + innerH);
+                rt->DrawText(snap.mediaSourceName.c_str(), (UINT32)snap.mediaSourceName.size(), fmtMedSub, rcSrc, brMedSub);
+            }
+
+            // Audio Visualizer Bars (bottom-right in Dual-Row, center-right in Single-Row)
+            float waveX = medX + medBoxW - waveW;
+            float waveCy_Dual = 1.0f + innerH * 0.75f;
+            float waveCy_Single = 1.0f + innerH * 0.50f;
+            float waveCy = waveCy_Dual + (waveCy_Single - waveCy_Dual) * layoutT;
+            float waveMaxH = 11.0f + 3.0f * layoutT;
+            DrawAudioVisualizer(rt, waveX, waveCy, waveW, waveMaxH, ColorRefToD2D(m_config->mediaWaveColor, medAlpha));
+
+            if (brMedTitle) brMedTitle->Release();
+            if (brMedSub) brMedSub->Release();
+        }
+        if (fmtMedTitle) fmtMedTitle->Release();
+        if (fmtMedSub) fmtMedSub->Release();
+    }
+
+    if (activeItems.empty()) return;
+
+    // ==================== 2. Draw Hardware Telemetry Block (with 2D Single <-> Dual Tweening) ====================
     struct ItemRenderData {
         int mIdx;
         std::wstring title;
@@ -584,18 +849,13 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
         items[i].val2 = buf2;
     }
 
-    float padX = 20.0f;
-    float innerH = h - 4.0f;
     float titleValGap = 4.0f;
     float tempSlotGap = 4.0f;
 
-    // Reference logical widths for Dual-Row and Single-Row so font scaling is monotonic during tweening
     float wDualRef = 260.0f, hDualRef = 36.0f, wSingleRef = 396.0f, hSingleRef = 28.0f;
     GetDualAndSingleLogicalSize(m_config, wDualRef, hDualRef, wSingleRef, hSingleRef);
-    float fullW_Dual = wDualRef + 16.0f;
-    float fullW_Single = wSingleRef + 16.0f;
-    float innerW_Dual = fullW_Dual - padX * 2.0f;
-    float innerW_Single = fullW_Single - padX * 2.0f;
+    float innerW_Dual = (wDualRef + 16.0f) - padX * 2.0f;
+    float innerW_Single = (wSingleRef + 16.0f) - padX * 2.0f;
 
     float fontDual = 11.0f;
     float fontSingle = 11.0f * (count >= 3 ? 0.90f : 1.0f);
@@ -638,7 +898,6 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
     float sumItemsW = createFormatsAndMeasure(baseFontSize);
     if (!fmtTitle || !fmtValueRight) return;
 
-    // Check if either Single-Row or Dual-Row needs font shrink for long custom titles
     float minItemGap = 12.0f;
     float neededSingleW = sumItemsW + (count > 1 ? (count - 1) * minItemGap : 0.0f);
     float scaleSingle = (neededSingleW > innerW_Single && neededSingleW > 1.0f)
@@ -672,7 +931,7 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
         }
     }
 
-    // 1. Compute Single-Row target coordinates relative to horizontal center
+    // 1. Single-Row coordinates relative to hardware region center
     float gapSingle = (count > 1) ? std::max(6.0f, (innerW_Single - sumItemsW) / (float)(count - 1)) : 0.0f;
     float totalRowW = sumItemsW + gapSingle * (count - 1);
     float startX_Single = -totalRowW * 0.5f;
@@ -686,24 +945,23 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
         runX += items[i].totalW + gapSingle;
     }
 
-    // 2. Compute Dual-Row target coordinates relative to horizontal center
+    // 2. Dual-Row coordinates relative to hardware region center
     int rowsDual = (count + 1) / 2;
     float cellH_Dual = innerH / (float)rowsDual;
     std::vector<float> dxDual(count), yDual(count), hDual(count), titleSlotDual(count);
     for (int i = 0; i < count; ++i) {
         int r = i / 2;
         int c = i % 2;
-        float xInDual = padX + c * cellW_Dual + 4.0f;
-        dxDual[i] = xInDual - fullW_Dual * 0.5f;
+        float xInDual = c * cellW_Dual + 4.0f;
+        dxDual[i] = xInDual - innerW_Dual * 0.5f;
         yDual[i] = 1.0f + r * cellH_Dual;
         hDual[i] = cellH_Dual;
         titleSlotDual[i] = colMaxTitleW[c];
     }
 
-    // 3. Render each item at the smoothly interpolated (Dual <-> Single) coordinates!
-    float centerX = w * 0.5f;
+    float hwCenterX = hwStartX + hwRegionW * 0.5f;
     for (int i = 0; i < count; ++i) {
-        float curX = centerX + dxDual[i] + (dxSingle[i] - dxDual[i]) * layoutT;
+        float curX = hwCenterX + dxDual[i] + (dxSingle[i] - dxDual[i]) * layoutT;
         float curY = yDual[i] + (ySingle[i] - yDual[i]) * layoutT;
         float curH = hDual[i] + (hSingle[i] - hDual[i]) * layoutT;
         float curTitleW = titleSlotDual[i] + (titleSlotSingle[i] - titleSlotDual[i]) * layoutT;
@@ -743,25 +1001,30 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     if (alpha <= 0.02f || !m_config || !m_telemetry) return;
 
     TelemetrySnapshot snap = m_telemetry->GetSnapshot();
+    UpdateAlbumArtBitmap(rt, snap);
 
     IDWriteTextFormat* fmtHeader = nullptr;
     IDWriteTextFormat* fmtCardTitle = nullptr;
     IDWriteTextFormat* fmtCardBig = nullptr;
     IDWriteTextFormat* fmtCardSub = nullptr;
-    IDWriteTextFormat* fmtTip = nullptr;
+    IDWriteTextFormat* fmtTime = nullptr;
 
     m_dwriteFactory->CreateTextFormat(L"Segoe UI Semibold", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10.5f, L"zh-TW", &fmtHeader);
     m_dwriteFactory->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-TW", &fmtCardTitle);
     m_dwriteFactory->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"zh-TW", &fmtCardBig);
-    m_dwriteFactory->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 9.8f, L"zh-TW", &fmtCardSub);
-    m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10.5f, L"zh-TW", &fmtTip);
+    m_dwriteFactory->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 9.6f, L"zh-TW", &fmtCardSub);
+    m_dwriteFactory->CreateTextFormat(L"Segoe UI Semibold", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 9.0f, L"zh-TW", &fmtTime);
 
-    if (!fmtHeader || !fmtCardTitle || !fmtCardBig || !fmtCardSub || !fmtTip) return;
+    if (!fmtHeader || !fmtCardTitle || !fmtCardBig || !fmtCardSub || !fmtTime) return;
 
+    fmtHeader->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fmtCardBig->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-    fmtTip->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fmtCardSub->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    fmtTime->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
-    float padX = 20.0f;
+    float padX = 16.0f; // Symmetric horizontal & bottom padding
+    float expCornerRadius = std::max((float)m_config->cornerRadius, padX + 8.0f);
+    float cardRadius = std::max(4.0f, expCornerRadius - padX); // Concentric: R_card = R_notch - pad
 
     ID2D1SolidColorBrush* brGreen = nullptr;
     ID2D1SolidColorBrush* brMuted = nullptr;
@@ -770,10 +1033,44 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     rt->CreateSolidColorBrush(D2D1::ColorF(0.29f, 0.87f, 0.50f, alpha), &brGreen);
     rt->CreateSolidColorBrush(D2D1::ColorF(0.65f, 0.71f, 0.80f, alpha), &brMuted);
     rt->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.055f * alpha), &brCardBg);
-    rt->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.10f * alpha), &brBarBg);
+    rt->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.12f * alpha), &brBarBg);
 
+    auto drawIconBtn = [&](const D2D1_RECT_F& rcBtn, FaIconType icon, int hoverId, bool activeHighlight = false) {
+        bool isHov = (m_hoverButtonId == hoverId);
+        COLORREF rawBg = (isHov || activeHighlight) ? m_config->btnHoverColor : m_config->btnColor;
+        int lum = (GetRValue(rawBg) * 299 + GetGValue(rawBg) * 587 + GetBValue(rawBg) * 114) / 1000;
+        D2D1_COLOR_F bgCol = ColorRefToD2D(rawBg, (isHov ? 0.96f : 0.90f) * alpha);
+        D2D1_COLOR_F icCol = (lum > 145)
+            ? D2D1::ColorF(0.05f, 0.06f, 0.09f, alpha)
+            : D2D1::ColorF(0.95f, 0.96f, 0.98f, alpha);
+        D2D1_COLOR_F bdrCol = isHov
+            ? ColorRefToD2D(m_config->btnHoverColor, alpha)
+            : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f * alpha);
+
+        ID2D1SolidColorBrush* brBtnBg = nullptr;
+        ID2D1SolidColorBrush* brBtnIc = nullptr;
+        ID2D1SolidColorBrush* brBtnBdr = nullptr;
+        rt->CreateSolidColorBrush(bgCol, &brBtnBg);
+        rt->CreateSolidColorBrush(icCol, &brBtnIc);
+        rt->CreateSolidColorBrush(bdrCol, &brBtnBdr);
+
+        if (brBtnBg) rt->FillRoundedRectangle(D2D1::RoundedRect(rcBtn, 6.0f, 6.0f), brBtnBg);
+        if (brBtnBdr) rt->DrawRoundedRectangle(D2D1::RoundedRect(rcBtn, 6.0f, 6.0f), brBtnBdr, 1.0f);
+        if (brBtnIc) {
+            float icx = (rcBtn.left + rcBtn.right) * 0.5f;
+            float icy = (rcBtn.top + rcBtn.bottom) * 0.5f;
+            float icSz = std::min(rcBtn.right - rcBtn.left, rcBtn.bottom - rcBtn.top) * 0.54f;
+            ::DrawFaIcon(m_d2dFactory, rt, icon, icx, icy, icSz, brBtnIc, bgCol, m_layoutAnim);
+        }
+
+        if (brBtnBg) brBtnBg->Release();
+        if (brBtnIc) brBtnIc->Release();
+        if (brBtnBdr) brBtnBdr->Release();
+    };
+
+    // ==================== 1. Top Header Bar (2.0 Line-Height) + Top-Right Buttons ====================
     if (brGreen) {
-        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(padX + 4.0f, 12.0f), 4.0f, 4.0f), brGreen);
+        rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(padX + 5.0f, 18.0f), 4.0f, 4.0f), brGreen);
     }
 
     std::wstring shortCpu = snap.cpuName;
@@ -785,13 +1082,137 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     if (gPos != std::wstring::npos) shortGpu = shortGpu.substr(gPos + 7);
 
     std::wstring headerStr = shortCpu + L"  •  " + shortGpu;
-    D2D1_RECT_F rcHeader = D2D1::RectF(padX + 12.0f, 4.0f, w - padX, 20.0f);
+    D2D1_RECT_F rcHeader = D2D1::RectF(padX + 16.0f, 0.0f, w - padX - 72.0f, 36.0f);
     if (brMuted) rt->DrawText(headerStr.c_str(), (UINT32)headerStr.size(), fmtHeader, rcHeader, brMuted);
 
-    // 2x2 Hardware Telemetry Cards (4px grid + fixed 4-char right-aligned slots!)
-    float gridTop = 24.0f;
+    // Top-right Settings & Click-Through Lock buttons (centered vertically in 36px header bar)
+    m_btnSettingsRect = D2D1::RectF(w - padX - 62.0f, 6.0f, w - padX - 34.0f, 30.0f);
+    m_btnLockRect     = D2D1::RectF(w - padX - 28.0f, 6.0f, w - padX,         30.0f);
+    drawIconBtn(m_btnSettingsRect, FA_ICON_GEAR, 1, false);
+    drawIconBtn(m_btnLockRect,     FA_ICON_LOCK, 3, false);
+
+    // ==================== 2. Side-by-Side Docked Layout: Media Control Panel & 2x2 Hardware Grid ====================
+    float gridTop = 40.0f; // 2.0 line-height header + 4px breathing gap
     float gap = 8.0f;
-    float cardW = (w - padX * 2.0f - gap) * 0.5f;
+    float easeMedia = Smoothstep01(m_mediaAnim);
+    float easeDock  = Smoothstep01(m_mediaDockAnim); // 0.0 = Media Left, 1.0 = Media Right
+
+    float medCardW = 200.0f;
+    float medAllocW = (medCardW + gap) * easeMedia;
+    float totalBodyW = w - padX * 2.0f;
+    float hwBodyW = std::max(240.0f, totalBodyW - medAllocW);
+    float hwStartX = padX + medAllocW * (1.0f - easeDock);
+
+    // -------------------- 2A. Expanded Media Control Panel (Full-height on Left or Right) --------------------
+    if (easeMedia > 0.02f && !snap.mediaTitle.empty()) {
+        float medAlpha = alpha * easeMedia;
+        float medX_Left  = padX;
+        float medX_Right = w - padX - medCardW;
+        float mx = medX_Left + (medX_Right - medX_Left) * easeDock;
+        float my = gridTop;
+        float mh = 120.0f; // Matches 2 * 56 + 8 = 120px height of the 2x2 hardware grid!
+
+        D2D1_RECT_F rcMedCard = D2D1::RectF(mx, my, mx + medCardW, my + mh);
+        if (brCardBg) {
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rcMedCard, cardRadius, cardRadius), brCardBg);
+        }
+
+        // Top row of Media Card: 40x40 Album Art + Source Pill / Switcher + Title Marquee + Artist
+        D2D1_RECT_F rcArt = D2D1::RectF(mx + 8.0f, my + 8.0f, mx + 48.0f, my + 48.0f);
+        DrawRoundedAlbumArt(rt, rcArt, 6.0f, medAlpha);
+
+        // Source / Player Switcher Pill on top-right of Media Card
+        m_btnMediaSwitchRect = D2D1::RectF(mx + 56.0f, my + 6.0f, mx + medCardW - 26.0f, my + 20.0f);
+        bool hovSw = (m_hoverButtonId == 10);
+        ID2D1SolidColorBrush* brWave = nullptr;
+        ID2D1SolidColorBrush* brTitle = nullptr;
+        rt->CreateSolidColorBrush(ColorRefToD2D(m_config->mediaWaveColor, medAlpha), &brWave);
+        rt->CreateSolidColorBrush(ColorRefToD2D(m_config->mediaTitleColor, medAlpha), &brTitle);
+
+        std::wstring srcLabel = snap.mediaSourceName;
+        if (snap.mediaSessionCount > 1) {
+            srcLabel += L" ⇄";
+        }
+        if (hovSw || snap.mediaSessionCount > 1) {
+            rt->DrawText(srcLabel.c_str(), (UINT32)srcLabel.size(), fmtTime, m_btnMediaSwitchRect, hovSw ? brTitle : brWave);
+        } else if (brWave) {
+            rt->DrawText(srcLabel.c_str(), (UINT32)srcLabel.size(), fmtTime, m_btnMediaSwitchRect, brWave);
+        }
+
+        // Audio Peak Visualizer on top-right corner of Media Card
+        DrawAudioVisualizer(rt, mx + medCardW - 22.0f, my + 13.0f, 14.0f, 10.0f, ColorRefToD2D(m_config->mediaWaveColor, medAlpha));
+
+        // Track Title Marquee
+        D2D1_RECT_F rcTrack = D2D1::RectF(mx + 56.0f, my + 20.0f, mx + medCardW - 8.0f, my + 36.0f);
+        DrawMarqueeText(rt, m_dwriteFactory, fmtCardTitle, snap.mediaTitle, rcTrack, brTitle, m_marqueeOffset);
+
+        // Artist / Channel Name
+        std::wstring artistStr = snap.mediaArtist.empty() ? L"正在播放媒體" : snap.mediaArtist;
+        D2D1_RECT_F rcArtist = D2D1::RectF(mx + 56.0f, my + 36.0f, mx + medCardW - 8.0f, my + 50.0f);
+        if (brMuted) {
+            rt->PushAxisAlignedClip(rcArtist, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            rt->DrawText(artistStr.c_str(), (UINT32)artistStr.size(), fmtCardSub, rcArtist, brMuted);
+            rt->PopAxisAlignedClip();
+        }
+
+        // Middle Row: Interactive Timeline Seek Bar (01:24 [====o----] 04:03)
+        wchar_t posBuf[16], durBuf[16];
+        swprintf(posBuf, 16, L"%02d:%02d", snap.mediaPosSec / 60, snap.mediaPosSec % 60);
+        swprintf(durBuf, 16, L"%02d:%02d", snap.mediaDurSec / 60, snap.mediaDurSec % 60);
+
+        float seekY = my + 60.0f;
+        if (brMuted) {
+            rt->DrawText(posBuf, (UINT32)wcslen(posBuf), fmtTime, D2D1::RectF(mx + 8.0f, seekY - 7.0f, mx + 36.0f, seekY + 7.0f), brMuted);
+            fmtTime->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            rt->DrawText(durBuf, (UINT32)wcslen(durBuf), fmtTime, D2D1::RectF(mx + medCardW - 36.0f, seekY - 7.0f, mx + medCardW - 8.0f, seekY + 7.0f), brMuted);
+            fmtTime->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+
+        float barL = mx + 38.0f;
+        float barR = mx + medCardW - 38.0f;
+        float barW = std::max(10.0f, barR - barL);
+        m_rectMediaSeekBar = D2D1::RectF(barL, seekY - 6.0f, barR, seekY + 6.0f);
+        if (brBarBg) {
+            rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(barL, seekY - 2.0f, barR, seekY + 2.0f), 2.0f, 2.0f), brBarBg);
+        }
+        float prog = (snap.mediaDurSec > 0)
+            ? std::clamp((float)snap.mediaPosSec / (float)snap.mediaDurSec, 0.0f, 1.0f)
+            : 0.35f;
+        if (brWave) {
+            float fillX = barL + barW * prog;
+            rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(barL, seekY - 2.0f, fillX, seekY + 2.0f), 2.0f, 2.0f), brWave);
+            float knobR = (m_hoverButtonId == 16) ? 4.5f : 3.2f;
+            if ( brTitle ) rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(fillX, seekY), knobR, knobR), brTitle);
+        }
+
+        // Bottom Row: 5 Playback Control Buttons (Prev, -10s, Play/Pause, +10s, Next) on 4px grid!
+        float ctrlY = my + 84.0f;
+        float ctrlH = 28.0f;
+        float ctrlW = 32.0f;
+        float ctrlGap = 6.0f;
+        float totalCtrlW = ctrlW * 5.0f + ctrlGap * 4.0f;
+        float ctrlStartX = mx + (medCardW - totalCtrlW) * 0.5f;
+
+        m_btnMediaPrevRect = D2D1::RectF(ctrlStartX + 0 * (ctrlW + ctrlGap), ctrlY, ctrlStartX + 0 * (ctrlW + ctrlGap) + ctrlW, ctrlY + ctrlH);
+        m_btnMediaRewRect  = D2D1::RectF(ctrlStartX + 1 * (ctrlW + ctrlGap), ctrlY, ctrlStartX + 1 * (ctrlW + ctrlGap) + ctrlW, ctrlY + ctrlH);
+        m_btnMediaPlayRect = D2D1::RectF(ctrlStartX + 2 * (ctrlW + ctrlGap), ctrlY, ctrlStartX + 2 * (ctrlW + ctrlGap) + ctrlW, ctrlY + ctrlH);
+        m_btnMediaFfwdRect = D2D1::RectF(ctrlStartX + 3 * (ctrlW + ctrlGap), ctrlY, ctrlStartX + 3 * (ctrlW + ctrlGap) + ctrlW, ctrlY + ctrlH);
+        m_btnMediaNextRect = D2D1::RectF(ctrlStartX + 4 * (ctrlW + ctrlGap), ctrlY, ctrlStartX + 4 * (ctrlW + ctrlGap) + ctrlW, ctrlY + ctrlH);
+
+        drawIconBtn(m_btnMediaPrevRect, FA_ICON_STEP_BACK, 11, false);
+        drawIconBtn(m_btnMediaRewRect,  FA_ICON_BACKWARD,  12, false);
+        drawIconBtn(m_btnMediaPlayRect, snap.mediaIsPlaying ? FA_ICON_PAUSE : FA_ICON_PLAY, 13, true);
+        drawIconBtn(m_btnMediaFfwdRect, FA_ICON_FORWARD,   14, false);
+        drawIconBtn(m_btnMediaNextRect, FA_ICON_STEP_FWD,  15, false);
+
+        if (brWave) brWave->Release();
+        if (brTitle) brTitle->Release();
+    } else {
+        m_btnMediaSwitchRect = m_btnMediaPrevRect = m_btnMediaRewRect = m_btnMediaPlayRect = m_btnMediaFfwdRect = m_btnMediaNextRect = m_rectMediaSeekBar = {};
+    }
+
+    // -------------------- 2B. 2x2 Hardware Telemetry Cards --------------------
+    float cardW = (hwBodyW - gap) * 0.5f;
     float cardH = 56.0f;
 
     float cardSlot1W = std::max(
@@ -872,12 +1293,12 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
 
         int r = pos / 2;
         int c = pos % 2;
-        float x = padX + c * (cardW + gap);
+        float x = hwStartX + c * (cardW + gap);
         float y = gridTop + r * (cardH + gap);
 
         D2D1_RECT_F rcCard = D2D1::RectF(x, y, x + cardW, y + cardH);
         if (brCardBg) {
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard, 8.0f, 8.0f), brCardBg);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard, cardRadius, cardRadius), brCardBg);
         }
 
         ID2D1SolidColorBrush* brTitle = nullptr;
@@ -924,54 +1345,6 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
         if (brVal2) brVal2->Release();
     }
 
-    // 3. Bottom Bar: 3 Centered Font Awesome Icon Buttons (4px grid!)
-    float btnY = gridTop + 2 * (cardH + gap) + 4.0f;
-    float btnH = 24.0f;
-    float iconBtnW = 40.0f;
-    float btnGap = 12.0f;
-
-    float totalBtnsW = iconBtnW * 3.0f + btnGap * 2.0f;
-    float startX = (w - totalBtnsW) * 0.5f;
-
-    m_btnSettingsRect = D2D1::RectF(startX, btnY, startX + iconBtnW, btnY + btnH);
-    m_btnLayoutRect   = D2D1::RectF(startX + iconBtnW + btnGap, btnY, startX + iconBtnW * 2.0f + btnGap, btnY + btnH);
-    m_btnLockRect     = D2D1::RectF(startX + (iconBtnW + btnGap) * 2.0f, btnY, startX + iconBtnW * 3.0f + btnGap * 2.0f, btnY + btnH);
-
-    const D2D1_RECT_F btnRects[3] = { m_btnSettingsRect, m_btnLayoutRect, m_btnLockRect };
-    const FaIconType btnIcons[3] = { FA_ICON_GEAR, FA_ICON_LAYOUT, FA_ICON_LOCK };
-
-    for (int b = 0; b < 3; ++b) {
-        bool isHov = (m_hoverButtonId == (b + 1));
-        COLORREF rawBg = isHov ? m_config->btnHoverColor : m_config->btnColor;
-        int lum = (GetRValue(rawBg) * 299 + GetGValue(rawBg) * 587 + GetBValue(rawBg) * 114) / 1000;
-        D2D1_COLOR_F bgCol = ColorRefToD2D(rawBg, (isHov ? 0.96f : 0.90f) * alpha);
-        D2D1_COLOR_F icCol = (lum > 145)
-            ? D2D1::ColorF(0.05f, 0.06f, 0.09f, alpha)
-            : D2D1::ColorF(0.95f, 0.96f, 0.98f, alpha);
-        D2D1_COLOR_F bdrCol = isHov
-            ? ColorRefToD2D(m_config->btnHoverColor, alpha)
-            : D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.14f * alpha);
-
-        ID2D1SolidColorBrush* brBtnBg = nullptr;
-        ID2D1SolidColorBrush* brBtnIc = nullptr;
-        ID2D1SolidColorBrush* brBtnBdr = nullptr;
-        rt->CreateSolidColorBrush(bgCol, &brBtnBg);
-        rt->CreateSolidColorBrush(icCol, &brBtnIc);
-        rt->CreateSolidColorBrush(bdrCol, &brBtnBdr);
-
-        if (brBtnBg) rt->FillRoundedRectangle(D2D1::RoundedRect(btnRects[b], 6.0f, 6.0f), brBtnBg);
-        if (brBtnBdr) rt->DrawRoundedRectangle(D2D1::RoundedRect(btnRects[b], 6.0f, 6.0f), brBtnBdr, 1.0f);
-        if (brBtnIc) {
-            float icx = (btnRects[b].left + btnRects[b].right) * 0.5f;
-            float icy = (btnRects[b].top + btnRects[b].bottom) * 0.5f;
-            ::DrawFaIcon(m_d2dFactory, rt, btnIcons[b], icx, icy, 12.5f, brBtnIc, bgCol, m_layoutAnim);
-        }
-
-        if (brBtnBg) brBtnBg->Release();
-        if (brBtnIc) brBtnIc->Release();
-        if (brBtnBdr) brBtnBdr->Release();
-    }
-
     if (brGreen) brGreen->Release();
     if (brMuted) brMuted->Release();
     if (brCardBg) brCardBg->Release();
@@ -981,7 +1354,7 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     fmtCardTitle->Release();
     fmtCardBig->Release();
     fmtCardSub->Release();
-    fmtTip->Release();
+    fmtTime->Release();
 }
 
 void NotchWindow::RenderToTarget(ID2D1RenderTarget* rt, float canvasLogW, float drawW, float drawH, float expandRatio, float scale) {
@@ -995,9 +1368,12 @@ void NotchWindow::RenderToTarget(ID2D1RenderTarget* rt, float canvasLogW, float 
     D2D1_COLOR_F fillCol = ColorRefToD2D(m_config->bgColor, bgAlpha);
     D2D1_COLOR_F borderCol = ColorRefToD2D(m_config->borderColor, 0.75f);
 
-    DrawNotchShape(rt, drawW, drawH, (float)m_config->cornerRadius, fillCol, borderCol);
-
     float easeExp = Smoothstep01(expandRatio);
+    float colRadius = (float)m_config->cornerRadius;
+    float expRadius = std::max(colRadius, 16.0f + 8.0f);
+    float curRadius = colRadius + (expRadius - colRadius) * easeExp;
+    DrawNotchShape(rt, drawW, drawH, curRadius, fillCol, borderCol);
+
     float colAlpha = std::clamp(1.0f - (easeExp * 2.0f), 0.0f, 1.0f);
     float expAlpha = std::clamp((easeExp - 0.30f) * 1.43f, 0.0f, 1.0f);
 
@@ -1019,8 +1395,8 @@ void NotchWindow::RenderAndPresent() {
     float wDual = 260.0f, hDual = 36.0f, wSingle = 396.0f, hSingle = 28.0f;
     GetDualAndSingleLogicalSize(m_config, wDual, hDual, wSingle, hSingle);
 
-    // Pre-allocate a stable canvas large enough for Dual-Row, Single-Row, and Expanded states
-    float maxLogW = std::max({ wDual, wSingle, (float)m_config->expandedWidth, m_currW }) + 24.0f;
+    // Pre-allocate a stable canvas large enough for Dual-Row, Single-Row, and Expanded + Media states
+    float maxLogW = std::max({ wDual + 184.0f, wSingle + 184.0f, (float)m_config->expandedWidth + 208.0f, m_currW }) + 24.0f;
     float maxLogH = std::max({ hDual, hSingle, (float)m_config->expandedHeight, m_currH }) + 8.0f;
 
     int canvasW = (((int)std::ceil(maxLogW * scale) + 3) / 4) * 4;
@@ -1058,11 +1434,21 @@ bool NotchWindow::SavePreviewBmp(const std::wstring& bmpPath, bool expandedState
     if (!m_dcRenderTarget || !m_config) return false;
 
     m_layoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
+    m_mediaDockAnim = (m_config->mediaDockSide == 1) ? 1.0f : 0.0f;
+    bool hasMed = (m_telemetry && m_config->mediaEnabled && m_telemetry->GetSnapshot().hasMediaSession);
+    m_mediaAnim = hasMed ? 1.0f : 0.0f;
+
+    float easeLayout = Smoothstep01(m_layoutAnim);
+    float easeMedia  = Smoothstep01(m_mediaAnim);
     float scale = m_config->GetEffectiveScale();
-    float baseW = m_config->GetCollapsedLogicalWidth();
+
+    float baseW = m_config->GetCollapsedLogicalWidth() + (160.0f + 16.0f * easeLayout) * easeMedia;
     float baseH = m_config->GetCollapsedLogicalHeight();
-    int logW = (((int)(expandedState ? m_config->expandedWidth : baseW) + 16 + 3) / 4) * 4;
-    int logH = (((int)(expandedState ? m_config->expandedHeight : baseH) + 3) / 4) * 4;
+    float expW  = (float)m_config->expandedWidth + 208.0f * easeMedia;
+    float expH  = (float)m_config->expandedHeight;
+
+    int logW = (((int)(expandedState ? expW : baseW) + 16 + 3) / 4) * 4;
+    int logH = (((int)(expandedState ? expH : baseH) + 3) / 4) * 4;
     int w = (((int)std::round(logW * scale) + 2) / 4) * 4;
     int h = (((int)std::round(logH * scale) + 2) / 4) * 4;
 
@@ -1089,7 +1475,10 @@ bool NotchWindow::SavePreviewBmp(const std::wstring& bmpPath, bool expandedState
             m_dcRenderTarget->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale));
             m_dcRenderTarget->Clear(D2D1::ColorF(0.14f, 0.17f, 0.24f, 1.0f));
             float bgAlpha = std::clamp(m_config->bgOpacity / 255.0f, 0.35f, 1.0f);
-            DrawNotchShape(m_dcRenderTarget, (float)logW, (float)logH, (float)m_config->cornerRadius,
+            float colRadius = (float)m_config->cornerRadius;
+            float expRadius = std::max(colRadius, 16.0f + 8.0f);
+            float radius = expandedState ? expRadius : colRadius;
+            DrawNotchShape(m_dcRenderTarget, (float)logW, (float)logH, radius,
                            ColorRefToD2D(m_config->bgColor, bgAlpha),
                            ColorRefToD2D(m_config->borderColor, 0.85f));
             if (expandedState) {

@@ -42,9 +42,16 @@ enum {
     ZONE_BTN_RESET,
     ZONE_BTN_SAVE,
 
-    // Indexed by metric ID (mIdx 0..3): base = 100 + mIdx * 10 + sub
-    // sub: 1=enable toggle, 2=temp toggle, 3=title edit box, 4=title color, 5=value color, 6=drag handle
-    ZONE_ROW_BASE = 100
+    // 2D Block Canvas interactive blocks (0..3 = CPU/GPU/RAM/FPS, 4 = MEDIA)
+    ZONE_BLOCK_BASE = 100, // 100..104
+
+    // Single-Row Property Inspector controls (for currently selected block m_selectedBlock)
+    ZONE_INSP_ENABLE = 120,
+    ZONE_INSP_TEMP = 121,
+    ZONE_INSP_TITLE = 122,
+    ZONE_INSP_TCOL = 123,
+    ZONE_INSP_VCOL = 124,
+    ZONE_INSP_MEDIADOCK = 125
 };
 
 static COLORREF g_customColors[16] = {
@@ -62,8 +69,8 @@ static int ColorLum(COLORREF c) {
     return (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
 }
 
-static bool IsDragZoneId(int zoneId) {
-    return (zoneId >= ZONE_ROW_BASE && zoneId < ZONE_ROW_BASE + 40 && ((zoneId - ZONE_ROW_BASE) % 10 == 6));
+static bool IsBlockDragZone(int zoneId) {
+    return (zoneId >= ZONE_BLOCK_BASE && zoneId <= ZONE_BLOCK_BASE + 4);
 }
 
 SettingsWindow::SettingsWindow() {
@@ -131,28 +138,93 @@ bool SettingsWindow::InitD2D() {
     );
     if (FAILED(m_d2dFactory->CreateDCRenderTarget(&props, &m_dcRenderTarget))) return false;
     m_dcRenderTarget->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+    D2D1_STROKE_STYLE_PROPERTIES ssp = D2D1::StrokeStyleProperties(
+        D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+        D2D1_LINE_JOIN_ROUND, 10.0f, D2D1_DASH_STYLE_DASH, 0.0f
+    );
+    m_d2dFactory->CreateStrokeStyle(&ssp, nullptr, 0, &m_dashedStroke);
     return true;
 }
 
 void SettingsWindow::CleanupD2D() {
     FreeOffscreen();
+    if (m_dashedStroke) { m_dashedStroke->Release(); m_dashedStroke = nullptr; }
     if (m_dcRenderTarget) { m_dcRenderTarget->Release(); m_dcRenderTarget = nullptr; }
     if (m_dwriteFactory) { m_dwriteFactory->Release(); m_dwriteFactory = nullptr; }
     if (m_d2dFactory) { m_d2dFactory->Release(); m_d2dFactory = nullptr; }
+}
+
+void SettingsWindow::ComputeTargetBlockRects(float layoutAnim, D2D1_RECT_F outRects[5]) const {
+    if (!m_config) return;
+    float sLay = std::clamp(layoutAnim, 0.0f, 1.0f);
+    sLay = sLay * sLay * (3.0f - 2.0f * sLay);
+
+    // Canvas bounds: x = 28..572 (w = 544), y = 262..358 (h = 96)
+    // Canvas inner bounds: x = 36..564 (w = 528), y = 268..352 (h = 84)
+    bool dockRight = (m_config->mediaDockSide == 1);
+
+    // 1. Media block (index 4)
+    float mW0 = 136.0f;
+    float mH0 = 84.0f;
+    float mX0 = dockRight ? (564.0f - mW0) : 36.0f;
+    float mY0 = 268.0f;
+
+    float mW1 = 124.0f;
+    float mH1 = 56.0f;
+    float mX1 = dockRight ? (564.0f - mW1) : 36.0f;
+    float mY1 = 282.0f;
+
+    float mx = mX0 + (mX1 - mX0) * sLay;
+    float my = mY0 + (mY1 - mY0) * sLay;
+    float mw = mW0 + (mW1 - mW0) * sLay;
+    float mh = mH0 + (mH1 - mH0) * sLay;
+    outRects[4] = D2D1::RectF(mx, my, mx + mw, my + mh);
+
+    // 2. Hardware blocks (indices 0..3) ordered by itemOrder[pos]
+    float hwStartX0 = dockRight ? 36.0f : (36.0f + 136.0f + 12.0f); // 184.0f when media is left
+    float hwW0 = 184.0f;
+    float hwH0 = 38.0f;
+    float gapX0 = 12.0f;
+    float gapY0 = 8.0f;
+
+    float hwStartX1 = dockRight ? 36.0f : (36.0f + 124.0f + 12.0f); // 172.0f when media is left
+    float hwW1 = 92.0f;
+    float hwH1 = 56.0f;
+    float gapX1 = 8.0f;
+
+    for (int pos = 0; pos < 4; ++pos) {
+        int mIdx = m_config->itemOrder[pos];
+        if (mIdx < 0 || mIdx >= 4) continue;
+
+        int col0 = pos % 2;
+        int row0 = pos / 2;
+        float x0 = hwStartX0 + col0 * (hwW0 + gapX0);
+        float y0 = 268.0f + row0 * (hwH0 + gapY0);
+
+        float x1 = hwStartX1 + pos * (hwW1 + gapX1);
+        float y1 = 282.0f;
+
+        float bx = x0 + (x1 - x0) * sLay;
+        float by = y0 + (y1 - y0) * sLay;
+        float bw = hwW0 + (hwW1 - hwW0) * sLay;
+        float bh = hwH0 + (hwH1 - hwH0) * sLay;
+        outRects[mIdx] = D2D1::RectF(bx, by, bx + bw, by + bh);
+    }
+}
+
+void SettingsWindow::SnapBlocksToTargets() {
+    if (!m_config) return;
+    m_layoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
+    ComputeTargetBlockRects(m_layoutAnim, m_blockVisual);
+    m_blockAnimReady = true;
 }
 
 bool SettingsWindow::Create(HINSTANCE hInstance, AppConfig* config) {
     m_hInstance = hInstance;
     m_config = config;
     if (m_config) {
-        m_layoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
-        for (int pos = 0; pos < 4; ++pos) {
-            int mIdx = m_config->itemOrder[pos];
-            if (mIdx >= 0 && mIdx < 4) {
-                m_rowVisualY[mIdx] = 236.0f + pos * 40.0f;
-            }
-        }
-        m_rowAnimReady = true;
+        SnapBlocksToTargets();
     }
     if (!InitD2D()) return false;
 
@@ -169,7 +241,7 @@ bool SettingsWindow::Create(HINSTANCE hInstance, AppConfig* config) {
 
     float resScale = AppConfig::GetAutoResolutionScale();
     int winW = (((int)std::round(600.0f * resScale) + 2) / 4) * 4;
-    int winH = (((int)std::round(524.0f * resScale) + 2) / 4) * 4;
+    int winH = (((int)std::round(580.0f * resScale) + 2) / 4) * 4;
     int scrW = GetSystemMetrics(SM_CXSCREEN);
     int scrH = GetSystemMetrics(SM_CYSCREEN);
 
@@ -195,13 +267,7 @@ bool SettingsWindow::Create(HINSTANCE hInstance, AppConfig* config) {
 void SettingsWindow::Show() {
     if (!m_hwnd) return;
     QueryPerformanceCounter(&m_lastTick);
-    if (m_config) {
-        m_layoutAnim = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
-        for (int pos = 0; pos < 4; ++pos) {
-            int mIdx = m_config->itemOrder[pos];
-            if (mIdx >= 0 && mIdx < 4) m_rowVisualY[mIdx] = 236.0f + pos * 40.0f;
-        }
-    }
+    SnapBlocksToTargets();
     ShowWindow(m_hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(m_hwnd);
     InvalidateRect(m_hwnd, NULL, FALSE);
@@ -212,7 +278,7 @@ void SettingsWindow::Hide() {
     CommitTempEdit();
     m_focusedTitleRow = -1;
     m_focusedTempIdx = -1;
-    m_draggingMetric = -1;
+    m_draggingBlock = -1;
     ShowWindow(m_hwnd, SW_HIDE);
 }
 
@@ -292,12 +358,8 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
     float logW = (float)w / resScale;
     float logH = (float)h / resScale;
 
-    if (!m_rowAnimReady) {
-        for (int pos = 0; pos < 4; ++pos) {
-            int mIdx = m_config->itemOrder[pos];
-            if (mIdx >= 0 && mIdx < 4) m_rowVisualY[mIdx] = 236.0f + pos * 40.0f;
-        }
-        m_rowAnimReady = true;
+    if (!m_blockAnimReady) {
+        SnapBlocksToTargets();
     }
 
     auto addZone = [&](int id, D2D1_RECT_F rc) {
@@ -306,32 +368,38 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
 
     IDWriteTextFormat* fmtH1 = nullptr;
     IDWriteTextFormat* fmtSec = nullptr;
-    IDWriteTextFormat* fmtTh = nullptr;
+    IDWriteTextFormat* fmtSub = nullptr;
     IDWriteTextFormat* fmtLbl = nullptr;
     IDWriteTextFormat* fmtRight = nullptr;
     IDWriteTextFormat* fmtBtn = nullptr;
     IDWriteTextFormat* fmtBtnLeft = nullptr;
+    IDWriteTextFormat* fmtBlockTitle = nullptr;
+    IDWriteTextFormat* fmtBlockVal = nullptr;
 
     m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 15.0f, L"zh-TW", &fmtH1);
     m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"zh-TW", &fmtSec);
-    m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.2f, L"zh-TW", &fmtTh);
+    m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10.5f, L"zh-TW", &fmtSub);
     m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.6f, L"zh-TW", &fmtLbl);
     m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"zh-TW", &fmtRight);
     m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.2f, L"zh-TW", &fmtBtn);
     m_dwriteFactory->CreateTextFormat(L"Microsoft JhengHei UI", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.2f, L"zh-TW", &fmtBtnLeft);
+    m_dwriteFactory->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.5f, L"zh-TW", &fmtBlockTitle);
+    m_dwriteFactory->CreateTextFormat(L"Consolas", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10.5f, L"zh-TW", &fmtBlockVal);
 
-    if (!fmtH1 || !fmtSec || !fmtTh || !fmtLbl || !fmtRight || !fmtBtn || !fmtBtnLeft) return;
+    if (!fmtH1 || !fmtSec || !fmtSub || !fmtLbl || !fmtRight || !fmtBtn || !fmtBtnLeft || !fmtBlockTitle || !fmtBlockVal) return;
 
     fmtH1->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fmtSec->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    fmtTh->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-    fmtTh->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fmtSub->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fmtLbl->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fmtRight->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     fmtRight->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fmtBtn->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     fmtBtn->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     fmtBtnLeft->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fmtBlockTitle->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fmtBlockVal->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    fmtBlockVal->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
     auto measureBtnText = [&](const std::wstring& s) -> float {
         if (s.empty()) return 0.0f;
@@ -346,22 +414,24 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
     };
 
     ID2D1SolidColorBrush* brCard = nullptr;
-    ID2D1SolidColorBrush* brThBg = nullptr;
+    ID2D1SolidColorBrush* brCanvasBg = nullptr;
     ID2D1SolidColorBrush* brBorder = nullptr;
     ID2D1SolidColorBrush* brWinBorder = nullptr;
     ID2D1SolidColorBrush* brText = nullptr;
     ID2D1SolidColorBrush* brMuted = nullptr;
     ID2D1SolidColorBrush* brSliderFill = nullptr;
     ID2D1SolidColorBrush* brTrack = nullptr;
+    ID2D1SolidColorBrush* brSelect = nullptr;
 
     rt->CreateSolidColorBrush(D2D1::ColorF(0.082f, 0.086f, 0.102f, 1.0f), &brCard);
-    rt->CreateSolidColorBrush(D2D1::ColorF(0.118f, 0.125f, 0.149f, 1.0f), &brThBg);
+    rt->CreateSolidColorBrush(D2D1::ColorF(0.051f, 0.055f, 0.068f, 1.0f), &brCanvasBg);
     rt->CreateSolidColorBrush(D2D1::ColorF(0.180f, 0.192f, 0.224f, 1.0f), &brBorder);
     rt->CreateSolidColorBrush(D2D1::ColorF(0.240f, 0.255f, 0.295f, 1.0f), &brWinBorder);
     rt->CreateSolidColorBrush(D2D1::ColorF(0.96f, 0.96f, 0.97f, 1.0f), &brText);
     rt->CreateSolidColorBrush(D2D1::ColorF(0.58f, 0.61f, 0.67f, 1.0f), &brMuted);
     rt->CreateSolidColorBrush(ToD2D(m_config->btnHoverColor), &brSliderFill);
     rt->CreateSolidColorBrush(D2D1::ColorF(0.145f, 0.153f, 0.180f, 1.0f), &brTrack);
+    rt->CreateSolidColorBrush(D2D1::ColorF(0.290f, 0.871f, 0.502f, 1.0f), &brSelect); // #4ADE80 GPU Green Selection
 
     rt->BeginDraw();
     rt->SetTransform(D2D1::Matrix3x2F::Scale(resScale, resScale));
@@ -462,131 +532,263 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
     ID2D1SolidColorBrush* brLogo = nullptr;
     rt->CreateSolidColorBrush(D2D1::ColorF(0.902f, 0.745f, 0.353f, 1.0f), &brLogo); // #E6BE5A Gold Logo
     if (brLogo) {
-        DrawFaIcon(m_d2dFactory, rt, FA_ICON_LOGO, 28.0f, 20.0f, 16.0f, brLogo);
+        DrawFaIcon(m_d2dFactory, rt, FA_ICON_LOGO, 28.0f, 22.0f, 16.0f, brLogo);
         brLogo->Release();
     }
-    rt->DrawText(L"設定", 2, fmtH1, D2D1::RectF(44, 8, 120, 32), brText);
+    rt->DrawText(L"設定", 2, fmtH1, D2D1::RectF(44, 10, 120, 34), brText);
 
     const wchar_t* wheelTip = L"瀏海可藉由滾輪縮放";
-    rt->DrawText(wheelTip, (UINT32)wcslen(wheelTip), fmtRight, D2D1::RectF(200, 8, logW - 84, 32), brMuted);
+    rt->DrawText(wheelTip, (UINT32)wcslen(wheelTip), fmtRight, D2D1::RectF(200, 10, logW - 84, 34), brMuted);
 
-    // Custom Minimize (—) & Close (✕) Buttons on top-right
-    drawButton(ZONE_WIN_MIN,   L"", logW - 76.0f, 8.0f, 28.0f, 24.0f, false, FA_ICON_MINUS, false, false);
-    drawButton(ZONE_WIN_CLOSE, L"", logW - 44.0f, 8.0f, 28.0f, 24.0f, false, FA_ICON_XMARK, false, true);
+    // Custom Minimize (—) & Close (✕) Buttons on top-right (h = 24, cy = 22)
+    drawButton(ZONE_WIN_MIN,   L"", logW - 76.0f, 10.0f, 28.0f, 24.0f, false, FA_ICON_MINUS, false, false);
+    drawButton(ZONE_WIN_CLOSE, L"", logW - 44.0f, 10.0f, 28.0f, 24.0f, false, FA_ICON_XMARK, false, true);
 
-    // ==================== CARD 1: 外觀與尺寸 (4px Grid, 2x2 Sliders, No Font Size Slider) ====================
-    D2D1_RECT_F rcCard1 = D2D1::RectF(16, 40, logW - 16, 184);
-    rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard1, 8.0f, 8.0f), brCard);
-    rt->DrawRoundedRectangle(D2D1::RoundedRect(rcCard1, 8.0f, 8.0f), brBorder, 1.0f);
-
-    DrawFaIcon(m_d2dFactory, rt, FA_ICON_SLIDERS, 36.0f, 56.0f, 12.0f, brText);
-    rt->DrawText(L"外觀與尺寸", 5, fmtSec, D2D1::RectF(48, 44, 220, 68), brText);
-
+    // ==================== SECTION 1: 外觀與尺寸 (Exterior Title + Grouped Card) ====================
     float effScale = m_config->GetEffectiveScale();
     int physW = (((int)std::round(m_config->GetCollapsedLogicalWidth() * effScale) + 2) / 4) * 4;
     int physH = (((int)std::round(m_config->GetCollapsedLogicalHeight() * effScale) + 2) / 4) * 4;
     wchar_t dimBuf[96];
     swprintf(dimBuf, 96, L"%d × %d px (%.2fx)", physW, physH, effScale);
-    rt->DrawText(dimBuf, (UINT32)wcslen(dimBuf), fmtRight, D2D1::RectF(300, 44, logW - 28, 68), brMuted);
 
-    // 2x2 Slider Grid (Scale %, Opacity %, Base Width px, Base Height px)
-    drawSlider(ZONE_SLIDER_UISCALE, L"整體縮放", m_config->uiScalePct, 60, 220, L"%",   28,  72, 256, 112.0f);
-    drawSlider(ZONE_SLIDER_OPACITY, L"不透明度", (m_config->bgOpacity * 100) / 255, 35, 100, L"%", 308, 72, 264, 112.0f);
-    drawSlider(ZONE_SLIDER_WIDTH,   L"基準寬度", m_config->notchWidth, 200, 420, L" px", 28,  104, 256, 112.0f);
-    drawSlider(ZONE_SLIDER_HEIGHT,  L"基準高度", m_config->notchHeight, 28,  68, L" px", 308, 104, 264, 112.0f);
+    // Section 1 Exterior Title Header
+    DrawFaIcon(m_d2dFactory, rt, FA_ICON_SLIDERS, 28.0f, 58.0f, 12.0f, brText);
+    rt->DrawText(L"外觀與尺寸", 5, fmtSec, D2D1::RectF(44, 48, 220, 68), brText);
+    rt->DrawText(dimBuf, (UINT32)wcslen(dimBuf), fmtRight, D2D1::RectF(300, 48, logW - 20, 68), brMuted);
 
-    // 7 Quick Controls on bottom row of Card 1 (y = 140, h = 32)
-    std::wstring layTxt = (m_config->layoutMode == 0) ? L"雙行" : L"單行";
-    drawButton(ZONE_BTN_LAYOUT, layTxt, 28, 140, 80, 32, m_config->layoutMode == 1, FA_ICON_LAYOUT);
+    // Card 1 Container (y = 72..204, h = 132)
+    D2D1_RECT_F rcCard1 = D2D1::RectF(16, 72, logW - 16, 204);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard1, 8.0f, 8.0f), brCard);
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(rcCard1, 8.0f, 8.0f), brBorder, 1.0f);
 
+    // 2x2 Slider Grid inside Card 1 (Scale %, Opacity %, Base Width px, Base Height px)
+    drawSlider(ZONE_SLIDER_UISCALE, L"整體縮放", m_config->uiScalePct, 60, 220, L"%",   28,  84, 256, 112.0f);
+    drawSlider(ZONE_SLIDER_OPACITY, L"不透明度", (m_config->bgOpacity * 100) / 255, 35, 100, L"%", 308, 84, 264, 112.0f);
+    drawSlider(ZONE_SLIDER_WIDTH,   L"基準寬度", m_config->notchWidth, 200, 420, L" px", 28,  116, 256, 112.0f);
+    drawSlider(ZONE_SLIDER_HEIGHT,  L"基準高度", m_config->notchHeight, 28,  68, L" px", 308, 116, 264, 112.0f);
+
+    // 6 Quick Controls on row 3 inside Card 1 (y = 152, h = 32)
     wchar_t refTxt[32];
-    swprintf(refTxt, 32, L"%d ms", m_config->refreshIntervalMs);
-    drawButton(ZONE_BTN_REFRESH, refTxt, 112, 140, 76, 32, false);
+    swprintf(refTxt, 32, L"更新: %d ms", m_config->refreshIntervalMs);
+    drawButton(ZONE_BTN_REFRESH, refTxt, 28, 152, 100, 32, false);
 
-    std::wstring fpsTxt = (m_config->fpsIdleMode == 0) ? L"待機: --" : L"待機: Hz";
-    drawButton(ZONE_BTN_FPS_IDLE, fpsTxt, 192, 140, 84, 32, false);
+    std::wstring fpsTxt = (m_config->fpsIdleMode == 0) ? L"FPS待機: --" : L"FPS待機: Hz";
+    drawButton(ZONE_BTN_FPS_IDLE, fpsTxt, 136, 152, 108, 32, false);
 
-    drawSwatch(ZONE_SWATCH_BG,     L"底色", m_config->bgColor,       284, 140, 68, 32);
-    drawSwatch(ZONE_SWATCH_BORDER, L"邊框", m_config->borderColor,   356, 140, 68, 32);
-    drawSwatch(ZONE_SWATCH_BTN,    L"按鈕", m_config->btnColor,      428, 140, 68, 32);
-    drawSwatch(ZONE_SWATCH_BTNHOV, L"懸停", m_config->btnHoverColor, 500, 140, 72, 32);
+    drawSwatch(ZONE_SWATCH_BG,     L"底色", m_config->bgColor,       252, 152, 76, 32);
+    drawSwatch(ZONE_SWATCH_BORDER, L"邊框", m_config->borderColor,   336, 152, 76, 32);
+    drawSwatch(ZONE_SWATCH_BTN,    L"按鈕", m_config->btnColor,      420, 152, 72, 32);
+    drawSwatch(ZONE_SWATCH_BTNHOV, L"懸停", m_config->btnHoverColor, 500, 152, 72, 32);
 
-    // ==================== CARD 2: 監控欄位表格 (with <th> Header + Drag-to-Reorder + Tween Animation!) ====================
-    D2D1_RECT_F rcCard2 = D2D1::RectF(16, 196, logW - 16, 400);
+    // ==================== SECTION 2: 區塊拖曳版面配置 (Exterior Title + Grouped Card) ====================
+    std::wstring layBtnTxt = (m_config->layoutMode == 0) ? L"雙行網格" : L"單行橫條";
+
+    // Section 2 Exterior Title Header + Layout Toggle Button (y = 220..248)
+    DrawFaIcon(m_d2dFactory, rt, FA_ICON_LAYOUT, 28.0f, 234.0f, 12.0f, brText, D2D1::ColorF(0, 0, 0, 0), m_layoutAnim);
+    rt->DrawText(L"區塊拖曳版面配置", 8, fmtSec, D2D1::RectF(44, 220, 180, 248), brText);
+    rt->DrawText(L"拖曳積木調整位置・點擊積木於下方設定屬性", 20, fmtSub, D2D1::RectF(180, 220, 456, 248), brMuted);
+    drawButton(ZONE_BTN_LAYOUT, layBtnTxt, 464, 220, 108, 28, m_config->layoutMode == 1, FA_ICON_LAYOUT);
+
+    // Card 2 Container (y = 252..418, h = 166)
+    D2D1_RECT_F rcCard2 = D2D1::RectF(16, 252, logW - 16, 418);
     rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard2, 8.0f, 8.0f), brCard);
     rt->DrawRoundedRectangle(D2D1::RoundedRect(rcCard2, 8.0f, 8.0f), brBorder, 1.0f);
 
-    // Table Header (<th>) Bar (y = 204..228, h = 24)
-    D2D1_RECT_F rcThBar = D2D1::RectF(24, 204, logW - 24, 228);
-    rt->FillRoundedRectangle(D2D1::RoundedRect(rcThBar, 4.0f, 4.0f), brThBg);
+    // 2D Visual Simulated Notch Blueprint Canvas (y = 262..358, h = 96)
+    D2D1_RECT_F rcCanvas = D2D1::RectF(28, 262, logW - 28, 358);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(rcCanvas, 8.0f, 8.0f), brCanvasBg);
+    rt->DrawRoundedRectangle(D2D1::RoundedRect(rcCanvas, 8.0f, 8.0f), brBorder, 1.0f);
 
-    rt->DrawText(L"項目",   2, fmtTh, D2D1::RectF(28,  204, 128, 228), brText);
-    rt->DrawText(L"溫度",   2, fmtTh, D2D1::RectF(136, 204, 204, 228), brText);
-    rt->DrawText(L"標題",   2, fmtTh, D2D1::RectF(212, 204, 320, 228), brText);
-    rt->DrawText(L"標題色", 3, fmtTh, D2D1::RectF(328, 204, 412, 228), brText);
-    rt->DrawText(L"數值色", 3, fmtTh, D2D1::RectF(420, 204, 504, 228), brText);
-    rt->DrawText(L"排序",   2, fmtTh, D2D1::RectF(512, 204, 572, 228), brText);
+    // Subtle simulated top screen bezel bar inside the canvas
+    rt->FillRectangle(D2D1::RectF(160, 262, 440, 265), brBorder);
 
-    const wchar_t* shortNames[4] = { L"CPU", L"GPU", L"RAM", L"FPS" };
-    const FaIconType metricIcons[4] = { FA_ICON_CPU, FA_ICON_GPU, FA_ICON_RAM, FA_ICON_FPS };
+    const wchar_t* sampleValues[4] = { L"24%  52°C", L"41%  58°C", L"48%", L"120" };
+    const FaIconType blockIcons[5] = { FA_ICON_CPU, FA_ICON_GPU, FA_ICON_RAM, FA_ICON_FPS, FA_ICON_MUSIC };
 
-    auto drawMetricRow = [&](int mIdx, bool isDragged) {
-        const MetricConfig& mc = m_config->metrics[mIdx];
-        float ry = m_rowVisualY[mIdx];
-        int base = ZONE_ROW_BASE + mIdx * 10;
+    auto drawCanvasBlock = [&](int bIdx, bool isDragged) {
+        D2D1_RECT_F rc = m_blockVisual[bIdx];
+        addZone(ZONE_BLOCK_BASE + bIdx, rc);
 
-        if (isDragged) {
-            D2D1_RECT_F rcRowHighlight = D2D1::RectF(24.0f, ry - 2.0f, logW - 24.0f, ry + 34.0f);
-            rt->FillRoundedRectangle(D2D1::RoundedRect(rcRowHighlight, 6.0f, 6.0f), brThBg);
-            rt->DrawRoundedRectangle(D2D1::RoundedRect(rcRowHighlight, 6.0f, 6.0f), brText, 1.2f);
+        bool isMedia = (bIdx == 4);
+        bool enabled = isMedia ? m_config->mediaEnabled : m_config->metrics[bIdx].enabled;
+        bool selected = (m_selectedBlock == bIdx);
+        bool hovered = (m_hoveredZone == ZONE_BLOCK_BASE + bIdx);
+
+        COLORREF titleCol = isMedia ? m_config->mediaTitleColor : m_config->metrics[bIdx].titleColor;
+        COLORREF valCol   = isMedia ? m_config->mediaWaveColor  : m_config->metrics[bIdx].valueColor;
+
+        D2D1_COLOR_F blockBg = enabled
+            ? (selected ? D2D1::ColorF(0.145f, 0.165f, 0.215f, 0.98f) : D2D1::ColorF(0.110f, 0.120f, 0.150f, 0.95f))
+            : D2D1::ColorF(0.080f, 0.085f, 0.105f, 0.35f);
+
+        ID2D1SolidColorBrush* brB = nullptr;
+        rt->CreateSolidColorBrush(blockBg, &brB);
+        if (brB) {
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rc, 6.0f, 6.0f), brB);
+            brB->Release();
         }
 
-        // 1. Enable Toggle Button (FA Icon + short name)
-        drawButton(base + 1, shortNames[mIdx], 28, ry, 100, 32, mc.enabled, metricIcons[mIdx]);
-
-        // 2. Show Temp Toggle (CPU & GPU only)
-        if (mIdx == 0 || mIdx == 1) {
-            drawButton(base + 2, L"°C", 136, ry, 68, 32, mc.showTemp, FA_ICON_THERM);
+        // Border: GPU Green (#4ADE80) if selected, solid white if dragged, dashed semi-transparent if disabled!
+        if (!enabled && m_dashedStroke) {
+            rt->DrawRoundedRectangle(
+                D2D1::RoundedRect(rc, 6.0f, 6.0f),
+                selected ? brSelect : brMuted,
+                selected ? 1.8f : 1.2f,
+                m_dashedStroke
+            );
         } else {
-            rt->DrawText(L"—", 1, fmtBtn, D2D1::RectF(136, ry, 204, ry + 32), brMuted);
+            rt->DrawRoundedRectangle(
+                D2D1::RoundedRect(rc, 6.0f, 6.0f),
+                isDragged ? brText : (selected ? brSelect : (hovered ? brText : brBorder)),
+                (selected || isDragged) ? 1.8f : 1.0f
+            );
         }
 
-        // 3. Editable Custom Title Box
-        D2D1_RECT_F rcTitleBox = D2D1::RectF(212, ry, 320, ry + 32);
-        addZone(base + 3, rcTitleBox);
+        float alpha = enabled ? 1.0f : 0.35f;
+        ID2D1SolidColorBrush* brT = nullptr;
+        ID2D1SolidColorBrush* brV = nullptr;
+        rt->CreateSolidColorBrush(ToD2D(titleCol, alpha), &brT);
+        rt->CreateSolidColorBrush(ToD2D(valCol, alpha), &brV);
+
+        // Top-right grip handle icon inside block
+        DrawFaIcon(m_d2dFactory, rt, FA_ICON_GRIP, rc.right - 12.0f, rc.top + 12.0f, 9.0f, selected ? brSelect : brMuted);
+
+        if (isMedia) {
+            float bh = rc.bottom - rc.top;
+            if (bh > 68.0f) {
+                // Tall Dual-Row Media Block on Canvas
+                DrawFaIcon(m_d2dFactory, rt, FA_ICON_MUSIC, rc.left + 16.0f, rc.top + 18.0f, 12.0f, brV ? brV : brText);
+                if (brT) {
+                    std::wstring mTitle = L"MEDIA 媒體";
+                    rt->DrawText(mTitle.c_str(), (UINT32)mTitle.size(), fmtBlockTitle,
+                                 D2D1::RectF(rc.left + 28.0f, rc.top + 6.0f, rc.right - 18.0f, rc.top + 30.0f), brT);
+                }
+                const wchar_t* dockDesc = (m_config->mediaDockSide == 0) ? L"靠左停駐 (可左右拖曳)" : L"靠右停駐 (可左右拖曳)";
+                rt->DrawText(dockDesc, (UINT32)wcslen(dockDesc), fmtSub,
+                             D2D1::RectF(rc.left + 10.0f, rc.top + 34.0f, rc.right - 8.0f, rc.top + 56.0f), brMuted);
+
+                // Draw miniature audio peak bars preview
+                if (brV) {
+                    const float barH[4] = { 8.0f, 15.0f, 11.0f, 14.0f };
+                    for (int b = 0; b < 4; ++b) {
+                        float bx = rc.left + 12.0f + b * 6.0f;
+                        float by = rc.bottom - 10.0f;
+                        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx, by - barH[b], bx + 3.5f, by), 1.5f, 1.5f), brV);
+                    }
+                    rt->DrawText(L"Spotify / YouTube", 17, fmtBlockVal,
+                                 D2D1::RectF(rc.left + 40.0f, rc.bottom - 26.0f, rc.right - 6.0f, rc.bottom - 6.0f), brV);
+                }
+            } else {
+                // Compact Single-Row Media Block on Canvas
+                DrawFaIcon(m_d2dFactory, rt, FA_ICON_MUSIC, rc.left + 14.0f, rc.top + 16.0f, 11.0f, brV ? brV : brText);
+                if (brT) {
+                    std::wstring mTitle = L"MEDIA";
+                    rt->DrawText(mTitle.c_str(), (UINT32)mTitle.size(), fmtBlockTitle,
+                                 D2D1::RectF(rc.left + 25.0f, rc.top + 4.0f, rc.right - 18.0f, rc.top + 28.0f), brT);
+                }
+                if (brV) {
+                    std::wstring subStr = (m_config->mediaDockSide == 0) ? L"ılıl 靠左" : L"ılıl 靠右";
+                    rt->DrawText(subStr.c_str(), (UINT32)subStr.size(), fmtBlockVal,
+                                 D2D1::RectF(rc.left + 10.0f, rc.top + 28.0f, rc.right - 6.0f, rc.bottom - 4.0f), brV);
+                }
+            }
+        } else {
+            // Hardware Block (0..3)
+            const MetricConfig& mc = m_config->metrics[bIdx];
+            float bh = rc.bottom - rc.top;
+            DrawFaIcon(m_d2dFactory, rt, blockIcons[bIdx], rc.left + 14.0f, rc.top + 15.0f, 11.0f, brT ? brT : brText);
+            if (brT) {
+                std::wstring dispT = mc.title;
+                rt->DrawText(dispT.c_str(), (UINT32)dispT.size(), fmtBlockTitle,
+                             D2D1::RectF(rc.left + 25.0f, rc.top + 3.0f, rc.right - 18.0f, rc.top + 27.0f), brT);
+            }
+            if (brV) {
+                if (bh > 48.0f) {
+                    // Single-Row taller block: value on second line
+                    rt->DrawText(sampleValues[bIdx], (UINT32)wcslen(sampleValues[bIdx]), fmtBlockVal,
+                                 D2D1::RectF(rc.left + 10.0f, rc.top + 27.0f, rc.right - 6.0f, rc.bottom - 4.0f), brV);
+                } else {
+                    // Dual-Row wide block: value on right side
+                    rt->DrawText(sampleValues[bIdx], (UINT32)wcslen(sampleValues[bIdx]), fmtBlockVal,
+                                 D2D1::RectF(rc.left + 86.0f, rc.top + 3.0f, rc.right - 18.0f, rc.bottom - 3.0f), brV);
+                }
+            }
+        }
+
+        if (brT) brT->Release();
+        if (brV) brV->Release();
+    };
+
+    // Draw non-dragged blocks first, then the actively dragged block on top
+    for (int bIdx = 0; bIdx < 5; ++bIdx) {
+        if (bIdx != m_draggingBlock) {
+            drawCanvasBlock(bIdx, false);
+        }
+    }
+    if (m_draggingBlock >= 0 && m_draggingBlock < 5) {
+        drawCanvasBlock(m_draggingBlock, true);
+    }
+
+    // ==================== Single-Row Property Inspector (y = 370..404, h = 34) ====================
+    if (m_selectedBlock >= 0 && m_selectedBlock < 4) {
+        int mIdx = m_selectedBlock;
+        const MetricConfig& mc = m_config->metrics[mIdx];
+        const wchar_t* shortNames[4] = { L"CPU", L"GPU", L"RAM", L"FPS" };
+
+        // 1. Enable Toggle
+        std::wstring enTxt = std::wstring(mc.enabled ? L"啟用: " : L"停用: ") + shortNames[mIdx];
+        drawButton(ZONE_INSP_ENABLE, enTxt, 28, 370, 108, 34, mc.enabled, blockIcons[mIdx]);
+
+        // 2. Show Temp Toggle (CPU/GPU only)
+        if (mIdx == 0 || mIdx == 1) {
+            drawButton(ZONE_INSP_TEMP, mc.showTemp ? L"顯示 °C" : L"隱藏 °C", 144, 370, 88, 34, mc.showTemp, FA_ICON_THERM);
+        } else {
+            drawButton(ZONE_INSP_TEMP, L"無溫度項", 144, 370, 88, 34, false, -1, true);
+        }
+
+        // 3. Editable Custom Title Input Box
+        D2D1_RECT_F rcTitleBox = D2D1::RectF(240, 370, 372, 404);
+        addZone(ZONE_INSP_TITLE, rcTitleBox);
         bool focused = (m_focusedTitleRow == mIdx);
-        bool hovTitle = (m_hoveredZone == base + 3);
+        bool hovTitle = (m_hoveredZone == ZONE_INSP_TITLE);
         rt->FillRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 4.0f, 4.0f), brTrack);
         rt->DrawRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 4.0f, 4.0f),
-                                 (focused || hovTitle) ? brText : brBorder,
+                                 (focused || hovTitle) ? brSelect : brBorder,
                                  focused ? 1.6f : 1.0f);
-
-        std::wstring dispTitle = mc.title + (focused ? L"|" : L"");
+        std::wstring dispTitle = L"標題: " + mc.title + (focused ? L"|" : L"");
         rt->DrawText(dispTitle.c_str(), (UINT32)dispTitle.size(), fmtBtn, rcTitleBox, brText);
 
         // 4. Title Color Swatch
-        drawSwatch(base + 4, L"", mc.titleColor, 328, ry, 84, 32);
+        std::wstring tHex = L"標題 " + ColorToHex(mc.titleColor);
+        drawSwatch(ZONE_INSP_TCOL, tHex.c_str(), mc.titleColor, 380, 370, 92, 34);
 
         // 5. Value Color Swatch
-        drawSwatch(base + 5, L"", mc.valueColor, 420, ry, 84, 32);
+        std::wstring vHex = L"數值 " + ColorToHex(mc.valueColor);
+        drawSwatch(ZONE_INSP_VCOL, vHex.c_str(), mc.valueColor, 480, 370, 92, 34);
+    } else {
+        // Selected Block == 4 (MEDIA 媒體)
+        drawButton(ZONE_INSP_ENABLE,
+                   m_config->mediaEnabled ? L"啟用: 媒體" : L"停用: 媒體",
+                   28, 370, 116, 34, m_config->mediaEnabled, FA_ICON_MUSIC);
 
-        // 6. Drag Handle (FA_ICON_GRIP, shows drag cursor IDC_SIZEALL on hover/drag!)
-        drawButton(base + 6, L"", 512, ry, 60, 32, isDragged, FA_ICON_GRIP);
-    };
+        drawButton(ZONE_INSP_MEDIADOCK,
+                   (m_config->mediaDockSide == 0) ? L"位置: 靠左停駐" : L"位置: 靠右停駐",
+                   152, 370, 136, 34, m_config->mediaDockSide == 1, FA_ICON_EXCHANGE);
 
-    // Draw non-dragged rows first, then the actively dragged row on top!
-    for (int pos = 0; pos < 4; ++pos) {
-        int mIdx = m_config->itemOrder[pos];
-        if (mIdx >= 0 && mIdx < 4 && mIdx != m_draggingMetric) {
-            drawMetricRow(mIdx, false);
-        }
+        std::wstring mTHex = L"曲名色 " + ColorToHex(m_config->mediaTitleColor);
+        drawSwatch(ZONE_INSP_TCOL, mTHex.c_str(), m_config->mediaTitleColor, 296, 370, 134, 34);
+
+        std::wstring mVHex = L"音波色 " + ColorToHex(m_config->mediaWaveColor);
+        drawSwatch(ZONE_INSP_VCOL, mVHex.c_str(), m_config->mediaWaveColor, 438, 370, 134, 34);
     }
-    if (m_draggingMetric >= 0 && m_draggingMetric < 4) {
-        drawMetricRow(m_draggingMetric, true);
-    }
 
-    // ==================== CARD 3: 溫度警戒 (可輸入 + 上下改動) 與系統狀態 ====================
-    D2D1_RECT_F rcCard3 = D2D1::RectF(16, 408, logW - 16, 460);
+    // ==================== SECTION 3: 系統行為與溫度警戒 (Exterior Title + Grouped Card) ====================
+    // Section 3 Exterior Title Header (y = 434..454)
+    DrawFaIcon(m_d2dFactory, rt, FA_ICON_BOLT, 28.0f, 444.0f, 12.0f, brText);
+    rt->DrawText(L"系統行為與溫度警戒", 9, fmtSec, D2D1::RectF(44, 434, 260, 454), brText);
+
+    // Card 3 Container (y = 458..506, h = 48)
+    D2D1_RECT_F rcCard3 = D2D1::RectF(16, 458, logW - 16, 506);
     rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard3, 8.0f, 8.0f), brCard);
     rt->DrawRoundedRectangle(D2D1::RoundedRect(rcCard3, 8.0f, 8.0f), brBorder, 1.0f);
 
@@ -607,45 +809,48 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
         drawButton(zoneDown, L"", x + 124, y, 24, 28, false, FA_ICON_DOWN);
     };
 
-    drawTempField(L"警戒", 0, ZONE_WARN_INPUT, ZONE_WARN_INC, ZONE_WARN_DEC, m_config->tempWarnC, 28.0f,  420.0f);
-    drawTempField(L"高溫", 1, ZONE_CRIT_INPUT, ZONE_CRIT_INC, ZONE_CRIT_DEC, m_config->tempCritC, 188.0f, 420.0f);
+    drawTempField(L"警戒", 0, ZONE_WARN_INPUT, ZONE_WARN_INC, ZONE_WARN_DEC, m_config->tempWarnC, 28.0f,  468.0f);
+    drawTempField(L"高溫", 1, ZONE_CRIT_INPUT, ZONE_CRIT_INC, ZONE_CRIT_DEC, m_config->tempCritC, 188.0f, 468.0f);
 
     drawButton(ZONE_BTN_CLICKTHROUGH,
                m_config->clickThroughLocked ? L"穿透鎖定" : L"自動展開",
-               348, 420, 112, 28,
+               348, 468, 112, 28,
                m_config->clickThroughLocked,
                m_config->clickThroughLocked ? FA_ICON_LOCK : FA_ICON_UNLOCK);
 
     drawButton(ZONE_BTN_AUTOSTART,
                L"開機自啟",
-               468, 420, 104, 28,
+               468, 468, 104, 28,
                m_config->autoStartAdmin,
                FA_ICON_BOLT);
 
-    // ==================== Bottom Action Bar (4px Grid) ====================
-    float botY = 472.0f;
-    drawButton(ZONE_BTN_RESET, L"還原",       16.0f,  botY, 276.0f, 36.0f, false, FA_ICON_RESET);
-    drawButton(ZONE_BTN_SAVE,  L"儲存並關閉", 308.0f, botY, 276.0f, 36.0f, true,  FA_ICON_SAVE);
+    // ==================== Bottom Action Bar (4px Grid, 2x Top Margin, Fit Content) ====================
+    float botY = 530.0f; // 24px margin below Card 3 (458..506)
+    drawButton(ZONE_BTN_RESET, L"還原",       350.0f, botY, 90.0f,  34.0f, false, FA_ICON_RESET);
+    drawButton(ZONE_BTN_SAVE,  L"儲存並關閉", 452.0f, botY, 132.0f, 34.0f, true,  FA_ICON_SAVE);
 
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     rt->EndDraw();
 
     brCard->Release();
-    brThBg->Release();
+    brCanvasBg->Release();
     brBorder->Release();
     brWinBorder->Release();
     brText->Release();
     brMuted->Release();
     brSliderFill->Release();
     brTrack->Release();
+    brSelect->Release();
 
     fmtH1->Release();
     fmtSec->Release();
-    fmtTh->Release();
+    fmtSub->Release();
     fmtLbl->Release();
     fmtRight->Release();
     fmtBtn->Release();
     fmtBtnLeft->Release();
+    fmtBlockTitle->Release();
+    fmtBlockVal->Release();
 }
 
 void SettingsWindow::HandleZoneClick(int zoneId, float mx, float my, const D2D1_RECT_F& rc) {
@@ -653,7 +858,9 @@ void SettingsWindow::HandleZoneClick(int zoneId, float mx, float my, const D2D1_
     if (zoneId != ZONE_WARN_INPUT && zoneId != ZONE_CRIT_INPUT) {
         CommitTempEdit();
     }
-    m_focusedTitleRow = -1;
+    if (zoneId != ZONE_INSP_TITLE) {
+        m_focusedTitleRow = -1;
+    }
 
     auto updateSlider = [&](int& field, int minV, int maxV, int step) {
         float pct = std::clamp((mx - (rc.left + 4.0f)) / std::max(1.0f, (rc.right - rc.left - 8.0f)), 0.0f, 1.0f);
@@ -760,43 +967,68 @@ void SettingsWindow::HandleZoneClick(int zoneId, float mx, float my, const D2D1_
         NotifyChanged();
         return;
     case ZONE_BTN_RESET:
+        QueryPerformanceCounter(&m_lastTick);
         m_config->ResetDefaults();
-        for (int pos = 0; pos < 4; ++pos) {
-            int mIdx = m_config->itemOrder[pos];
-            if (mIdx >= 0 && mIdx < 4) m_rowVisualY[mIdx] = 236.0f + pos * 40.0f;
-        }
+        SnapBlocksToTargets();
         NotifyChanged();
         return;
     case ZONE_BTN_SAVE:
         NotifyChanged();
         Hide();
         return;
-    }
 
-    if (zoneId >= ZONE_ROW_BASE && zoneId < ZONE_ROW_BASE + 40) {
-        int mIdx = (zoneId - ZONE_ROW_BASE) / 10;
-        int sub = (zoneId - ZONE_ROW_BASE) % 10;
-        if (mIdx < 0 || mIdx >= 4) return;
-
-        if (sub == 1) {
-            m_config->metrics[mIdx].enabled = !m_config->metrics[mIdx].enabled;
+    // Single-Row Property Inspector Handlers
+    case ZONE_INSP_ENABLE:
+        if (m_selectedBlock >= 0 && m_selectedBlock < 4) {
+            m_config->metrics[m_selectedBlock].enabled = !m_config->metrics[m_selectedBlock].enabled;
+        } else if (m_selectedBlock == 4) {
+            m_config->mediaEnabled = !m_config->mediaEnabled;
+        }
+        NotifyChanged();
+        return;
+    case ZONE_INSP_TEMP:
+        if (m_selectedBlock == 0 || m_selectedBlock == 1) {
+            m_config->metrics[m_selectedBlock].showTemp = !m_config->metrics[m_selectedBlock].showTemp;
             NotifyChanged();
-        } else if (sub == 2) {
-            m_config->metrics[mIdx].showTemp = !m_config->metrics[mIdx].showTemp;
-            NotifyChanged();
-        } else if (sub == 3) {
-            m_focusedTitleRow = mIdx;
-            InvalidateRect(m_hwnd, NULL, FALSE);
-        } else if (sub == 4) {
-            if (PickColor(m_config->metrics[mIdx].titleColor)) NotifyChanged();
-        } else if (sub == 5) {
-            if (PickColor(m_config->metrics[mIdx].valueColor)) NotifyChanged();
-        } else if (sub == 6) { // Start dragging this row!
-            m_draggingMetric = mIdx;
-            m_dragGrabOffsetY = my - m_rowVisualY[mIdx];
-            SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+        }
+        return;
+    case ZONE_INSP_TITLE:
+        if (m_selectedBlock >= 0 && m_selectedBlock < 4) {
+            m_focusedTitleRow = m_selectedBlock;
             InvalidateRect(m_hwnd, NULL, FALSE);
         }
+        return;
+    case ZONE_INSP_TCOL:
+        if (m_selectedBlock >= 0 && m_selectedBlock < 4) {
+            if (PickColor(m_config->metrics[m_selectedBlock].titleColor)) NotifyChanged();
+        } else if (m_selectedBlock == 4) {
+            if (PickColor(m_config->mediaTitleColor)) NotifyChanged();
+        }
+        return;
+    case ZONE_INSP_VCOL:
+        if (m_selectedBlock >= 0 && m_selectedBlock < 4) {
+            if (PickColor(m_config->metrics[m_selectedBlock].valueColor)) NotifyChanged();
+        } else if (m_selectedBlock == 4) {
+            if (PickColor(m_config->mediaWaveColor)) NotifyChanged();
+        }
+        return;
+    case ZONE_INSP_MEDIADOCK:
+        QueryPerformanceCounter(&m_lastTick);
+        m_config->mediaDockSide = (m_config->mediaDockSide == 0) ? 1 : 0;
+        NotifyChanged();
+        return;
+    }
+
+    // 2D Visual Block Click & Drag Start
+    if (IsBlockDragZone(zoneId)) {
+        int bIdx = zoneId - ZONE_BLOCK_BASE;
+        m_selectedBlock = bIdx;
+        m_draggingBlock = bIdx;
+        m_dragGrabOffsetX = mx - m_blockVisual[bIdx].left;
+        m_dragGrabOffsetY = my - m_blockVisual[bIdx].top;
+        QueryPerformanceCounter(&m_lastTick);
+        SetCursor(LoadCursor(NULL, IDC_SIZEALL));
+        InvalidateRect(m_hwnd, NULL, FALSE);
     }
 }
 
@@ -834,7 +1066,7 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             bool dirty = false;
             float targetLay = (m_config->layoutMode == 1) ? 1.0f : 0.0f;
             if (std::fabs(m_layoutAnim - targetLay) > 0.002f) {
-                float step = dt / 0.26f;
+                float step = dt / 0.24f;
                 if (m_layoutAnim < targetLay)
                     m_layoutAnim = std::min(targetLay, m_layoutAnim + step);
                 else
@@ -845,20 +1077,38 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 dirty = true;
             }
 
-            // High-FPS frame-rate-independent tween animation for row vertical positions
-            float rowAlpha = 1.0f - std::exp(-24.0f * dt);
-            for (int pos = 0; pos < 4; ++pos) {
-                int mIdx = m_config->itemOrder[pos];
-                if (mIdx < 0 || mIdx >= 4) continue;
-                if (mIdx == m_draggingMetric) continue; // Actively dragged row follows cursor directly
-                float targetY = 236.0f + pos * 40.0f;
-                if (std::fabs(m_rowVisualY[mIdx] - targetY) > 0.15f) {
-                    m_rowVisualY[mIdx] += (targetY - m_rowVisualY[mIdx]) * rowAlpha;
-                    dirty = true;
-                } else if (m_rowVisualY[mIdx] != targetY) {
-                    m_rowVisualY[mIdx] = targetY;
-                    dirty = true;
+            D2D1_RECT_F targets[5];
+            ComputeTargetBlockRects(m_layoutAnim, targets);
+            float alpha = 1.0f - std::exp(-24.0f * dt);
+
+            for (int bIdx = 0; bIdx < 5; ++bIdx) {
+                float curW = m_blockVisual[bIdx].right - m_blockVisual[bIdx].left;
+                float curH = m_blockVisual[bIdx].bottom - m_blockVisual[bIdx].top;
+                float tgtW = targets[bIdx].right - targets[bIdx].left;
+                float tgtH = targets[bIdx].bottom - targets[bIdx].top;
+
+                if (bIdx == m_draggingBlock) {
+                    // Keep width/height smoothly synced to layout mode even while dragging
+                    float nw = curW + (tgtW - curW) * alpha;
+                    float nh = curH + (tgtH - curH) * alpha;
+                    m_blockVisual[bIdx].right = m_blockVisual[bIdx].left + nw;
+                    m_blockVisual[bIdx].bottom = m_blockVisual[bIdx].top + nh;
+                    continue;
                 }
+
+                auto stepVal = [&](float& c, float t) {
+                    if (std::fabs(c - t) > 0.15f) {
+                        c += (t - c) * alpha;
+                        dirty = true;
+                    } else if (c != t) {
+                        c = t;
+                        dirty = true;
+                    }
+                };
+                stepVal(m_blockVisual[bIdx].left, targets[bIdx].left);
+                stepVal(m_blockVisual[bIdx].top, targets[bIdx].top);
+                stepVal(m_blockVisual[bIdx].right, targets[bIdx].right);
+                stepVal(m_blockVisual[bIdx].bottom, targets[bIdx].bottom);
             }
 
             if (dirty) {
@@ -892,29 +1142,76 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         float mx = (float)GET_X_LPARAM(lParam) / resScale;
         float my = (float)GET_Y_LPARAM(lParam) / resScale;
 
-        // 1. Handle active row drag-reorder with live slot swapping & tween animation
-        if (m_draggingMetric >= 0 && m_draggingMetric < 4 && (wParam & MK_LBUTTON)) {
+        // 1. Handle active 2D block drag on the canvas
+        if (m_draggingBlock >= 0 && m_draggingBlock < 5 && (wParam & MK_LBUTTON)) {
             SetCursor(LoadCursor(NULL, IDC_SIZEALL));
-            m_rowVisualY[m_draggingMetric] = std::clamp(my - m_dragGrabOffsetY, 236.0f, 356.0f);
-            int targetPos = std::clamp((int)std::round((m_rowVisualY[m_draggingMetric] - 236.0f) / 40.0f), 0, 3);
+            float bw = m_blockVisual[m_draggingBlock].right - m_blockVisual[m_draggingBlock].left;
+            float bh = m_blockVisual[m_draggingBlock].bottom - m_blockVisual[m_draggingBlock].top;
+            float newL = std::clamp(mx - m_dragGrabOffsetX, 32.0f, 568.0f - bw);
+            float newT = std::clamp(my - m_dragGrabOffsetY, 264.0f, 356.0f - bh);
+            m_blockVisual[m_draggingBlock] = D2D1::RectF(newL, newT, newL + bw, newT + bh);
 
-            int curPos = -1;
-            for (int p = 0; p < 4; ++p) {
-                if (m_config->itemOrder[p] == m_draggingMetric) {
-                    curPos = p;
-                    break;
+            float cx = newL + bw * 0.5f;
+            float cy = newT + bh * 0.5f;
+
+            if (m_draggingBlock == 4) {
+                // Dragging MEDIA block horizontally across midpoint swaps left/right dock!
+                int newDock = (cx >= 300.0f) ? 1 : 0;
+                if (newDock != m_config->mediaDockSide) {
+                    QueryPerformanceCounter(&m_lastTick);
+                    m_config->mediaDockSide = newDock;
+                    NotifyChanged(false);
+                } else {
+                    InvalidateRect(m_hwnd, NULL, FALSE);
                 }
-            }
-            if (curPos >= 0 && targetPos != curPos) {
-                QueryPerformanceCounter(&m_lastTick);
-                int step = (targetPos > curPos) ? 1 : -1;
-                for (int p = curPos; p != targetPos; p += step) {
-                    m_config->itemOrder[p] = m_config->itemOrder[p + step];
-                }
-                m_config->itemOrder[targetPos] = m_draggingMetric;
-                NotifyChanged(false);
             } else {
-                InvalidateRect(m_hwnd, NULL, FALSE);
+                // Dragging a Hardware Block (0..3) in 2D: find closest hardware slot center
+                D2D1_RECT_F targets[5];
+                ComputeTargetBlockRects(m_layoutAnim, targets);
+
+                // Compute slot centers for pos = 0..3
+                int curPos = -1;
+                for (int p = 0; p < 4; ++p) {
+                    if (m_config->itemOrder[p] == m_draggingBlock) {
+                        curPos = p;
+                        break;
+                    }
+                }
+
+                int bestPos = curPos;
+                float bestDist2 = 1e9f;
+                bool dockRight = (m_config->mediaDockSide == 1);
+                float sLay = m_layoutAnim * m_layoutAnim * (3.0f - 2.0f * m_layoutAnim);
+                float hwStartX0 = dockRight ? 36.0f : 184.0f;
+                float hwStartX1 = dockRight ? 36.0f : 172.0f;
+
+                for (int p = 0; p < 4; ++p) {
+                    float x0 = hwStartX0 + (p % 2) * (184.0f + 12.0f) + 92.0f;
+                    float y0 = 268.0f + (p / 2) * (38.0f + 8.0f) + 19.0f;
+                    float x1 = hwStartX1 + p * (92.0f + 8.0f) + 46.0f;
+                    float y1 = 282.0f + 28.0f;
+                    float sx = x0 + (x1 - x0) * sLay;
+                    float sy = y0 + (y1 - y0) * sLay;
+                    float dx = cx - sx;
+                    float dy = cy - sy;
+                    float d2 = dx * dx + dy * dy;
+                    if (d2 < bestDist2) {
+                        bestDist2 = d2;
+                        bestPos = p;
+                    }
+                }
+
+                if (curPos >= 0 && bestPos >= 0 && bestPos != curPos) {
+                    QueryPerformanceCounter(&m_lastTick);
+                    int step = (bestPos > curPos) ? 1 : -1;
+                    for (int p = curPos; p != bestPos; p += step) {
+                        m_config->itemOrder[p] = m_config->itemOrder[p + step];
+                    }
+                    m_config->itemOrder[bestPos] = m_draggingBlock;
+                    NotifyChanged(false);
+                } else {
+                    InvalidateRect(m_hwnd, NULL, FALSE);
+                }
             }
             return 0;
         }
@@ -930,7 +1227,7 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        // 3. Hover detection & cursor selection (IDC_SIZEALL for drag handle, IDC_HAND for buttons)
+        // 3. Hover detection & cursor selection (IDC_SIZEALL for draggable blocks, IDC_HAND for buttons)
         int hit = -1;
         for (const auto& z : m_hitZones) {
             if (mx >= z.rect.left && mx <= z.rect.right && my >= z.rect.top && my <= z.rect.bottom) {
@@ -938,7 +1235,7 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 break;
             }
         }
-        if (IsDragZoneId(hit)) {
+        if (IsBlockDragZone(hit)) {
             SetCursor(LoadCursor(NULL, IDC_SIZEALL));
         } else {
             SetCursor(LoadCursor(NULL, hit > 0 ? IDC_HAND : IDC_ARROW));
@@ -957,7 +1254,7 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         for (const auto& z : m_hitZones) {
             if (mx >= z.rect.left && mx <= z.rect.right && my >= z.rect.top && my <= z.rect.bottom) {
                 HandleZoneClick(z.id, mx, my, z.rect);
-                if (m_draggingMetric < 0 && m_draggingSliderZone < 0) {
+                if (m_draggingBlock < 0 && m_draggingSliderZone < 0) {
                     ReleaseCapture();
                 }
                 return 0;
@@ -968,16 +1265,17 @@ LRESULT SettingsWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         InvalidateRect(m_hwnd, NULL, FALSE);
         ReleaseCapture();
 
-        if (my < 40.0f) {
+        if (my < 44.0f) {
             SendMessageW(m_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
         }
         return 0;
     }
 
     case WM_LBUTTONUP:
-        if (m_draggingMetric >= 0 || m_draggingSliderZone >= 0) {
-            m_draggingMetric = -1;
+        if (m_draggingBlock >= 0 || m_draggingSliderZone >= 0) {
+            m_draggingBlock = -1;
             m_draggingSliderZone = -1;
+            QueryPerformanceCounter(&m_lastTick);
             ReleaseCapture();
             if (m_config) m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
             InvalidateRect(m_hwnd, NULL, FALSE);
@@ -1032,7 +1330,7 @@ bool SettingsWindow::SaveWindowBmp(const std::wstring& bmpPath) {
     if (!m_dcRenderTarget || !m_config) return false;
     float resScale = AppConfig::GetAutoResolutionScale();
     int w = (((int)std::round(600.0f * resScale) + 2) / 4) * 4;
-    int h = (((int)std::round(524.0f * resScale) + 2) / 4) * 4;
+    int h = (((int)std::round(580.0f * resScale) + 2) / 4) * 4;
 
     HDC hdcScreen = GetDC(NULL);
     HDC hdcMem = CreateCompatibleDC(hdcScreen);

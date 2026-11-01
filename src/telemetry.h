@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <string>
+#include <vector>
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -48,11 +49,28 @@ struct TelemetrySnapshot {
     int currentFps = 0;          // 0 when desktop idle (no 3D game in foreground)
     int monitorRefreshHz = 60;
     bool isGameActive = false;
+
+    // Media & Audio Telemetry (GSMTC + WASAPI CoreAudio)
+    bool hasMediaSession = false;
+    bool mediaIsPlaying = false;
+    int mediaSessionCount = 0;
+    int mediaActiveSessionIdx = 0;
+    std::wstring mediaTitle;
+    std::wstring mediaArtist;
+    std::wstring mediaSourceName;
+    int mediaPosSec = 0;
+    int mediaDurSec = 0;
+    float audioPeak = 0.0f;      // 0.0 ~ 1.0 real-time audio output peak
+    bool hasAlbumArt = false;
+    uint32_t albumArtVer = 0;
+    int albumArtW = 0;
+    int albumArtH = 0;
+    std::vector<uint32_t> albumArtBgra; // Premultiplied B8G8R8A8_UNORM thumbnail (48x48)
 };
 
 class TelemetryEngine {
 public:
-    TelemetryEngine();
+    TelemetryEngine(bool verifyMockMode = false);
     ~TelemetryEngine();
 
     void Start(int intervalMs = 500);
@@ -60,6 +78,18 @@ public:
     void SetIntervalMs(int intervalMs);
     void PollOnce();
     TelemetrySnapshot GetSnapshot();
+
+    // Fast real-time audio peak query (safe to call from 120FPS UI timer)
+    float PollAudioPeakFast();
+
+    // Media Playback Controls (GSMTC + Media Key Fallback)
+    void MediaPlayPause();
+    void MediaPrevTrack();
+    void MediaNextTrack();
+    void MediaSeekRelative(int deltaSec);
+    void MediaSeekToRatio(float ratio01);
+    void MediaCycleSession();
+    void SetPreviewMockMedia(bool enable);
 
 private:
     void WorkerLoop();
@@ -71,6 +101,7 @@ private:
     void UpdateCpuAndRam(const ShmSensorData& shm, bool shmValid);
     void UpdateGpu(const ShmSensorData& shm, bool shmValid);
     void UpdateFpsAndDisplay();
+    void UpdateMediaAndAudio();
 
     // Etw FPS trace thread
     void StartEtwFpsThread();
@@ -103,4 +134,15 @@ private:
     std::atomic<uint32_t> m_etwFrameCount{0};
     uint64_t m_lastFpsCalcTick = 0;
     int m_lastComputedFps = 0;
+
+    // Media & Audio state
+    std::atomic<int> m_preferredSessionIdx{-1}; // -1 = auto-select Playing session
+    std::atomic<int> m_pendingMediaCmd{0};      // 1=PlayPause, 2=Prev, 3=Next, 4=SeekRel, 5=SeekRatio
+    std::atomic<int> m_pendingSeekArg{0};       // deltaSec or ratio*10000
+    std::atomic<bool> m_mockMediaPreview{false};
+    std::wstring m_lastMediaTrackKey;
+    uint32_t m_albumArtVerCounter = 0;
+    std::vector<uint32_t> m_cachedArtBgra;
+    int m_cachedArtW = 0;
+    int m_cachedArtH = 0;
 };

@@ -36,12 +36,15 @@ private:
     void CleanupD2D();
     void EnsureCanvas(int reqW, int reqH);
     void FreeCanvas();
+    void UpdateAlbumArtBitmap(ID2D1RenderTarget* rt, const TelemetrySnapshot& snap);
     void OnTimerTick();
     void RenderAndPresent();
     void RenderToTarget(ID2D1RenderTarget* rt, float canvasLogW, float drawW, float drawH, float expandRatio, float scale);
 
     void DrawFaIcon(ID2D1RenderTarget* rt, FaIconType icon, float cx, float cy, float size, ID2D1Brush* brush);
     void DrawNotchShape(ID2D1RenderTarget* rt, float w, float h, float radius, D2D1_COLOR_F fillCol, D2D1_COLOR_F borderCol);
+    void DrawRoundedAlbumArt(ID2D1RenderTarget* rt, const D2D1_RECT_F& rc, float radius, float alpha);
+    void DrawAudioVisualizer(ID2D1RenderTarget* rt, float x, float cy, float w, float maxH, D2D1_COLOR_F col);
     void DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, float alpha);
     void DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, float alpha);
 
@@ -53,6 +56,10 @@ private:
     ID2D1Factory* m_d2dFactory = nullptr;
     IDWriteFactory* m_dwriteFactory = nullptr;
     ID2D1DCRenderTarget* m_dcRenderTarget = nullptr;
+    ID2D1Bitmap* m_albumBitmap = nullptr;
+    uint32_t m_albumBitmapVer = 0;
+    int m_albumBitmapW = 48;
+    int m_albumBitmapH = 48;
 
     // Persistent offscreen DIB canvas to avoid per-frame allocations & DWM surface thrashing
     HDC m_memDC = NULL;
@@ -69,14 +76,26 @@ private:
     // Animation & Interaction state
     bool m_isHovered = false;
     bool m_trackingMouse = false;
-    int m_hoverButtonId = 0;     // 0: none, 1: Settings, 2: Layout toggle, 3: Lock click-through
-    float m_animProgress = 0.0f; // 0.0 = collapsed, 1.0 = expanded
-    float m_layoutAnim = 0.0f;   // 0.0 = Dual-Row (2x2), 1.0 = Single-Row (1x4)
+    // Hover IDs: 0=none, 1=Settings, 3=Lock, 10=MediaSwitch, 11=Prev, 12=Rew(-10s), 13=PlayPause, 14=Ffwd(+10s), 15=Next, 16=SeekBar
+    int m_hoverButtonId = 0;
+    float m_animProgress = 0.0f;  // 0.0 = collapsed, 1.0 = expanded
+    float m_layoutAnim = 0.0f;    // 0.0 = Dual-Row (2x2), 1.0 = Single-Row (1x4)
+    float m_mediaAnim = 0.0f;     // 0.0 = Media Hidden, 1.0 = Media Active
+    float m_mediaDockAnim = 0.0f; // 0.0 = Docked Left, 1.0 = Docked Right
+    float m_marqueeOffset = 0.0f; // Continuous horizontal scroll offset (px)
+    float m_marqueePhase = 0.0f;
+    float m_audioBars[4] = { 0.18f, 0.28f, 0.22f, 0.16f };
     float m_currW = 260.0f;
     float m_currH = 36.0f;
 
-    // Interactive button rects in Expanded mode (in canvas logical coordinates)
+    // Interactive button rects in Expanded mode (in Notch local logical coordinates)
     D2D1_RECT_F m_btnSettingsRect = {};
-    D2D1_RECT_F m_btnLayoutRect = {};
     D2D1_RECT_F m_btnLockRect = {};
+    D2D1_RECT_F m_btnMediaSwitchRect = {};
+    D2D1_RECT_F m_btnMediaPrevRect = {};
+    D2D1_RECT_F m_btnMediaRewRect = {};
+    D2D1_RECT_F m_btnMediaPlayRect = {};
+    D2D1_RECT_F m_btnMediaFfwdRect = {};
+    D2D1_RECT_F m_btnMediaNextRect = {};
+    D2D1_RECT_F m_rectMediaSeekBar = {};
 };

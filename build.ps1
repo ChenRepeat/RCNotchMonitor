@@ -36,7 +36,7 @@ g++.exe -std=c++17 -O2 -municode -mwindows `
     "$ProjectRoot\src\settings_window.cpp" `
     "$ResObj" `
     -o "$TargetExe" `
-    -ld2d1 -ldwrite -ldwmapi -lpowrprof -lpsapi -ladvapi32 -lcomdlg32 -lgdi32 -luser32 -lshell32 -lole32 -lwinmm `
+    -ld2d1 -ldwrite -ldwmapi -lpowrprof -lpsapi -ladvapi32 -lcomdlg32 -lgdi32 -luser32 -lshell32 -lole32 -luuid -lwinmm `
     -static-libgcc -static-libstdc++ -s
 
 if ($LASTEXITCODE -ne 0) {

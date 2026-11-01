@@ -28,13 +28,13 @@ AppConfig::AppConfig() {
 }
 
 void AppConfig::ResetDefaults() {
-    configVersion = 4;
+    configVersion = 5;
     uiScalePct = 100;
     notchWidth = 260;
     notchHeight = 36;
     expandedWidth = 420;
-    expandedHeight = 188;
-    cornerRadius = 16;
+    expandedHeight = 176;
+    cornerRadius = 24;
     layoutMode = 0; // 0 = Dual Row, 1 = Single Row
     refreshIntervalMs = 500;
     fontSize = 11;
@@ -53,6 +53,11 @@ void AppConfig::ResetDefaults() {
     clickThroughLocked = false;
     fpsIdleMode = 0;
     autoStartAdmin = false;
+
+    mediaEnabled = true;
+    mediaDockSide = 0; // 0 = Left, 1 = Right
+    mediaTitleColor = RGB(248, 250, 252);
+    mediaWaveColor = RGB(74, 222, 128);
 
     // 0: CPU
     metrics[0].enabled = true;
@@ -117,7 +122,6 @@ float AppConfig::GetCollapsedLogicalHeight() const {
 float AppConfig::GetAutoResolutionScale() {
     int scrW = GetSystemMetrics(SM_CXSCREEN);
     if (scrW <= 1920) return 1.0f;
-    // Gentle square-root resolution scaling: 1080p -> 1.00x, 1440p -> 1.15x, 4K (3840) -> 1.41x
     float scale = std::sqrt((float)scrW / 1920.0f);
     return std::clamp(scale, 1.0f, 2.2f);
 }
@@ -213,7 +217,7 @@ bool AppConfig::LoadFromFile(const std::wstring& path) {
     cornerRadius = (std::clamp(ExtractJsonInt(json, L"cornerRadius", cornerRadius), 8, 32) / 4) * 4;
     layoutMode = std::clamp(ExtractJsonInt(json, L"layoutMode", layoutMode), 0, 1);
     refreshIntervalMs = std::clamp(ExtractJsonInt(json, L"refreshIntervalMs", refreshIntervalMs), 200, 5000);
-    fontSize = 11; // Locked base font size; scaled purely via Notch uiScalePct
+    fontSize = 11;
     bgOpacity = std::clamp(ExtractJsonInt(json, L"bgOpacity", bgOpacity), 80, 255);
     bgColor = HexToColor(ExtractJsonString(json, L"bgColor", ColorToHex(bgColor)), bgColor);
     borderColor = HexToColor(ExtractJsonString(json, L"borderColor", ColorToHex(borderColor)), borderColor);
@@ -225,7 +229,11 @@ bool AppConfig::LoadFromFile(const std::wstring& path) {
     fpsIdleMode = std::clamp(ExtractJsonInt(json, L"fpsIdleMode", fpsIdleMode), 0, 1);
     autoStartAdmin = ExtractJsonBool(json, L"autoStartAdmin", autoStartAdmin);
 
-    // Migrate oversized v2 config back to balanced v3/v4 defaults
+    mediaEnabled = ExtractJsonBool(json, L"mediaEnabled", mediaEnabled);
+    mediaDockSide = std::clamp(ExtractJsonInt(json, L"mediaDockSide", mediaDockSide), 0, 1);
+    mediaTitleColor = HexToColor(ExtractJsonString(json, L"mediaTitleColor", ColorToHex(mediaTitleColor)), mediaTitleColor);
+    mediaWaveColor = HexToColor(ExtractJsonString(json, L"mediaWaveColor", ColorToHex(mediaWaveColor)), mediaWaveColor);
+
     if (ver < 3) {
         uiScalePct = 100;
         notchWidth = 260;
@@ -235,8 +243,8 @@ bool AppConfig::LoadFromFile(const std::wstring& path) {
     if (ver < 4) {
         btnColor = RGB(30, 32, 38);
         btnHoverColor = RGB(244, 244, 246);
-        configVersion = 4;
     }
+    configVersion = 5;
 
     const wchar_t* prefixes[4] = {L"cpu", L"gpu", L"ram", L"fps"};
     for (int i = 0; i < 4; ++i) {
@@ -255,7 +263,7 @@ bool AppConfig::LoadFromFile(const std::wstring& path) {
 bool AppConfig::SaveToFile(const std::wstring& path) const {
     std::wstringstream ss;
     ss << L"{\n";
-    ss << L"  \"configVersion\": 4,\n";
+    ss << L"  \"configVersion\": 5,\n";
     ss << L"  \"uiScalePct\": " << uiScalePct << L",\n";
     ss << L"  \"notchWidth\": " << notchWidth << L",\n";
     ss << L"  \"notchHeight\": " << notchHeight << L",\n";
@@ -273,6 +281,10 @@ bool AppConfig::SaveToFile(const std::wstring& path) const {
     ss << L"  \"clickThroughLocked\": " << (clickThroughLocked ? L"true" : L"false") << L",\n";
     ss << L"  \"fpsIdleMode\": " << fpsIdleMode << L",\n";
     ss << L"  \"autoStartAdmin\": " << (autoStartAdmin ? L"true" : L"false") << L",\n";
+    ss << L"  \"mediaEnabled\": " << (mediaEnabled ? L"true" : L"false") << L",\n";
+    ss << L"  \"mediaDockSide\": " << mediaDockSide << L",\n";
+    ss << L"  \"mediaTitleColor\": \"" << ColorToHex(mediaTitleColor) << L"\",\n";
+    ss << L"  \"mediaWaveColor\": \"" << ColorToHex(mediaWaveColor) << L"\",\n";
 
     const wchar_t* prefixes[4] = {L"cpu", L"gpu", L"ram", L"fps"};
     for (int i = 0; i < 4; ++i) {

@@ -1,5 +1,8 @@
 #define _WIN32_WINNT 0x0A00
 #include "telemetry.h"
+#include "smtc_com.h"
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #include <intrin.h>
 #include <powrprof.h>
 #include <psapi.h>
@@ -7,6 +10,7 @@
 #include <evntcons.h>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
 #include <algorithm>
 #include <vector>
 
@@ -91,10 +95,21 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     }
 }
 
-TelemetryEngine::TelemetryEngine() {
+TelemetryEngine::TelemetryEngine(bool verifyMockMode) {
+    m_mockMediaPreview.store(verifyMockMode, std::memory_order_relaxed);
     InitCpuInfo();
-    InitNvml();
-    LaunchSensorBridge();
+    if (!verifyMockMode) {
+        InitNvml();
+        LaunchSensorBridge();
+    } else {
+        m_snapshot.gpuName = L"NVIDIA GeForce RTX 4070 SUPER";
+        m_snapshot.gpuUsagePct = 14;
+        m_snapshot.gpuTempC = 45;
+        m_snapshot.gpuVramUsedGb = 2.6f;
+        m_snapshot.gpuVramTotalGb = 12.0f;
+        m_snapshot.gpuPowerW = 18.0f;
+        m_snapshot.gpuFromNvml = true;
+    }
 
     // Prime CPU times
     FILETIME idle, kernel, user;
@@ -129,14 +144,16 @@ TelemetryEngine::~TelemetryEngine() {
 }
 
 void TelemetryEngine::InitCpuInfo() {
-    int cpuInfo[4] = {-1};
+    int cpuInfo[4] = {0};
     char brand[64] = {0};
     __cpuid(cpuInfo, 0x80000000);
-    unsigned int nExIds = cpuInfo[0];
+    unsigned int nExIds = (unsigned int)cpuInfo[0];
     if (nExIds >= 0x80000004) {
-        __cpuid((int*)(brand + 0), 0x80000002);
-        __cpuid((int*)(brand + 16), 0x80000003);
-        __cpuid((int*)(brand + 32), 0x80000004);
+        int regs[12] = {0};
+        __cpuid(&regs[0], 0x80000002);
+        __cpuid(&regs[4], 0x80000003);
+        __cpuid(&regs[8], 0x80000004);
+        std::memcpy(brand, regs, 48);
         std::wstring wbrand = TrimWide(AnsiToWide(brand));
         if (!wbrand.empty()) {
             m_snapshot.cpuName = wbrand;
@@ -514,6 +531,7 @@ void TelemetryEngine::PollOnce() {
     UpdateGpu(shm, shmValid);
     UpdateCpuAndRam(shm, shmValid);
     UpdateFpsAndDisplay();
+    UpdateMediaAndAudio();
 }
 
 void TelemetryEngine::Start(int intervalMs) {
@@ -544,8 +562,11 @@ void TelemetryEngine::WorkerLoop() {
         int totalWait = m_intervalMs.load();
         int waited = 0;
         while (waited < totalWait && m_running.load()) {
-            Sleep(50);
-            waited += 50;
+            if (m_pendingMediaCmd.load(std::memory_order_relaxed) != 0) {
+                UpdateMediaAndAudio();
+            }
+            Sleep(40);
+            waited += 40;
         }
     }
 }
@@ -553,4 +574,527 @@ void TelemetryEngine::WorkerLoop() {
 TelemetrySnapshot TelemetryEngine::GetSnapshot() {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_snapshot;
+}
+
+// ==============================================================================
+// Native GSMTC (Windows.Media.Control) + WASAPI CoreAudio Peak Meter
+// ==============================================================================
+static const CLSID CLSID_MMDeviceEnumerator_Local =
+    { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const IID IID_IMMDeviceEnumerator_Local =
+    { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const IID IID_IAudioMeterInformation_Local =
+    { 0xC02216F6, 0x8C67, 0x4B5B, { 0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00, 0x64 } };
+static const CLSID CLSID_WICImagingFactory_Local =
+    { 0xCACAF262, 0x9370, 0x4615, { 0xA1, 0x3B, 0x9F, 0x55, 0x39, 0xDA, 0x4C, 0x0A } };
+static const IID IID_IWICImagingFactory_Local =
+    { 0xEC5EC8A9, 0xC395, 0x4314, { 0x9C, 0x77, 0x54, 0xD7, 0xA9, 0x35, 0xFF, 0x70 } };
+static const GUID GUID_WICPixelFormat32bppPBGRA_Local =
+    { 0x6fddc324, 0x4e03, 0x4bfe, { 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x10 } };
+
+static std::wstring FormatMediaSourceName(const std::wstring& rawAppId) {
+    if (rawAppId.empty()) return L"Media";
+    std::wstring low = rawAppId;
+    for (auto& ch : low) ch = (wchar_t)std::towlower(ch);
+
+    if (low.find(L"spotify") != std::wstring::npos) return L"Spotify";
+    if (low.find(L"chrome") != std::wstring::npos) return L"YouTube";
+    if (low.find(L"msedge") != std::wstring::npos || low.find(L"edge") != std::wstring::npos) return L"Edge Media";
+    if (low.find(L"firefox") != std::wstring::npos || low.find(L"308046b0af4a39cb") != std::wstring::npos) return L"Firefox";
+    if (low.find(L"brave") != std::wstring::npos) return L"Brave";
+    if (low.find(L"applemusic") != std::wstring::npos || low.find(L"itunes") != std::wstring::npos) return L"Apple Music";
+    if (low.find(L"kkbox") != std::wstring::npos) return L"KKBOX";
+    if (low.find(L"foobar") != std::wstring::npos) return L"Foobar2000";
+    if (low.find(L"potplayer") != std::wstring::npos) return L"PotPlayer";
+    if (low.find(L"vlc") != std::wstring::npos) return L"VLC";
+    if (low.find(L"musicbee") != std::wstring::npos) return L"MusicBee";
+
+    std::wstring clean = rawAppId;
+    size_t slash = clean.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) clean = clean.substr(slash + 1);
+    size_t dot = clean.rfind(L".exe");
+    if (dot == std::wstring::npos) dot = clean.rfind(L".EXE");
+    if (dot != std::wstring::npos) clean = clean.substr(0, dot);
+    if (clean.size() > 14) clean = clean.substr(0, 14);
+    return clean.empty() ? L"Media" : clean;
+}
+
+static void GenerateProceduralSourceArt(const std::wstring& sourceName, std::vector<uint32_t>& outBgra, int& outW, int& outH) {
+    const int S = 48;
+    outW = S;
+    outH = S;
+    outBgra.assign(S * S, 0);
+
+    bool isSpotify = (sourceName.find(L"Spotify") != std::wstring::npos);
+    bool isYouTube = (sourceName.find(L"YouTube") != std::wstring::npos || sourceName.find(L"Chrome") != std::wstring::npos || sourceName.find(L"Edge") != std::wstring::npos);
+
+    // Branded background gradient colors
+    int r1 = isSpotify ? 24 : (isYouTube ? 220 : 56);
+    int g1 = isSpotify ? 196 : (isYouTube ? 38  : 189);
+    int b1 = isSpotify ? 90  : (isYouTube ? 38  : 248);
+
+    int r2 = isSpotify ? 14 : (isYouTube ? 130 : 124);
+    int g2 = isSpotify ? 95 : (isYouTube ? 18  : 58);
+    int b2 = isSpotify ? 46 : (isYouTube ? 24  : 237);
+
+    float cx = (S - 1) * 0.5f;
+    float cy = (S - 1) * 0.5f;
+
+    for (int y = 0; y < S; ++y) {
+        for (int x = 0; x < S; ++x) {
+            float t = (float)(x + y) / (float)(2 * S);
+            int r = (int)(r1 + (r2 - r1) * t);
+            int g = (int)(g1 + (g2 - g1) * t);
+            int b = (int)(b1 + (b2 - b1) * t);
+
+            float dx = x - cx;
+            float dy = y - cy;
+            float dist = std::sqrt(dx * dx + dy * dy);
+
+            if (isYouTube) {
+                // Crisp white play triangle in center
+                if (dx >= -5.0f && dx <= 7.0f && std::fabs(dy) <= (7.0f - dx) * 0.62f) {
+                    r = 250; g = 250; b = 252;
+                }
+            } else if (isSpotify) {
+                // Concentric sound wave arcs
+                if (dy < 4.0f && std::fabs(dx) < 11.0f) {
+                    float waveR = std::sqrt(dx * dx + (dy - 8.0f) * (dy - 8.0f));
+                    if (std::fabs(waveR - 9.0f) < 1.2f || std::fabs(waveR - 13.5f) < 1.2f || std::fabs(waveR - 18.0f) < 1.2f) {
+                        r = 248; g = 252; b = 249;
+                    }
+                }
+            } else {
+                // Vinyl disc grooves + center label
+                if (dist > 6.0f && dist < 17.0f && ((int)dist % 4 == 0)) {
+                    r = std::min(255, r + 35);
+                    g = std::min(255, g + 35);
+                    b = std::min(255, b + 35);
+                } else if (dist <= 4.5f) {
+                    r = 248; g = 250; b = 252;
+                }
+            }
+
+            outBgra[y * S + x] = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+        }
+    }
+}
+
+static bool DecodeThumbnailToBgra48(CombaseRuntime& rt, WinRT_IRandomAccessStreamReference* thumbRef,
+                                    std::vector<uint32_t>& outBgra, int& outW, int& outH) {
+    if (!thumbRef || !rt.pCreateStreamOverRandomAccessStream) return false;
+
+    WinRT_IAsyncOperationPtr* openOp = nullptr;
+    if (FAILED(thumbRef->OpenReadAsync(&openOp)) || !openOp) return false;
+
+    bool ok = false;
+    if (rt.WaitAsyncOp(openOp, 250)) {
+        IUnknown* rasUnk = nullptr;
+        if (SUCCEEDED(openOp->GetResults((void**)&rasUnk)) && rasUnk) {
+            IStream* pStream = nullptr;
+            if (SUCCEEDED(rt.pCreateStreamOverRandomAccessStream(rasUnk, IID_IStream, (void**)&pStream)) && pStream) {
+                IWICImagingFactory* wicFactory = nullptr;
+                if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory_Local, NULL, CLSCTX_INPROC_SERVER,
+                                               IID_IWICImagingFactory_Local, (void**)&wicFactory)) && wicFactory) {
+                    IWICBitmapDecoder* decoder = nullptr;
+                    if (SUCCEEDED(wicFactory->CreateDecoderFromStream(pStream, NULL, WICDecodeMetadataCacheOnDemand, &decoder)) && decoder) {
+                        IWICBitmapFrameDecode* frame = nullptr;
+                        if (SUCCEEDED(decoder->GetFrame(0, &frame)) && frame) {
+                            UINT srcW = 0, srcH = 0;
+                            frame->GetSize(&srcW, &srcH);
+                            if (srcW > 0 && srcH > 0) {
+                                // Center-crop square region if non-square (e.g. 16:9 YouTube thumbnail)
+                                IWICBitmapScaler* scaler = nullptr;
+                                if (SUCCEEDED(wicFactory->CreateBitmapScaler(&scaler)) && scaler) {
+                                    const UINT dstS = 48;
+                                    if (SUCCEEDED(scaler->Initialize(frame, dstS, dstS, WICBitmapInterpolationModeFant))) {
+                                        IWICFormatConverter* conv = nullptr;
+                                        if (SUCCEEDED(wicFactory->CreateFormatConverter(&conv)) && conv) {
+                                            if (SUCCEEDED(conv->Initialize(scaler, GUID_WICPixelFormat32bppPBGRA_Local,
+                                                                           WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) {
+                                                outW = (int)dstS;
+                                                outH = (int)dstS;
+                                                outBgra.resize(dstS * dstS);
+                                                if (SUCCEEDED(conv->CopyPixels(NULL, dstS * 4, dstS * dstS * 4, (BYTE*)outBgra.data()))) {
+                                                    ok = true;
+                                                }
+                                            }
+                                            conv->Release();
+                                        }
+                                    }
+                                    scaler->Release();
+                                }
+                            }
+                            frame->Release();
+                        }
+                        decoder->Release();
+                    }
+                    wicFactory->Release();
+                }
+                pStream->Release();
+            }
+            rasUnk->Release();
+        }
+    }
+    openOp->Release();
+    return ok;
+}
+
+MIDL_INTERFACE("C02216F6-8C67-4B5B-9D00-D008E73E0064")
+IAudioMeterInformation_Local : public IUnknown {
+public:
+    virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* pfPeak) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMeteringChannelCount(UINT* pnChannelCount) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetChannelsPeakValues(UINT32 u32ChannelCount, float* afPeakValues) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryHardwareSupport(DWORD* pdwHardwareSupportMask) = 0;
+};
+
+float TelemetryEngine::PollAudioPeakFast() {
+    if (m_mockMediaPreview.load(std::memory_order_relaxed)) {
+        return 0.68f;
+    }
+
+    static std::mutex s_meterMutex;
+    std::lock_guard<std::mutex> lock(s_meterMutex);
+
+    thread_local bool tl_coInit = false;
+    if (!tl_coInit) {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        tl_coInit = true;
+    }
+
+    static IMMDeviceEnumerator* s_enum = nullptr;
+    static IMMDevice* s_dev = nullptr;
+    static IAudioMeterInformation_Local* s_meter = nullptr;
+    static uint64_t s_lastRebindTick = 0;
+
+    uint64_t nowTick = GetTickCount64();
+    if (!s_meter || (nowTick - s_lastRebindTick > 4000)) {
+        s_lastRebindTick = nowTick;
+        if (s_meter) { s_meter->Release(); s_meter = nullptr; }
+        if (s_dev) { s_dev->Release(); s_dev = nullptr; }
+        if (!s_enum) {
+            CoCreateInstance(CLSID_MMDeviceEnumerator_Local, NULL, CLSCTX_INPROC_SERVER,
+                             IID_IMMDeviceEnumerator_Local, (void**)&s_enum);
+        }
+        if (s_enum) {
+            if (SUCCEEDED(s_enum->GetDefaultAudioEndpoint(eRender, eConsole, &s_dev)) && s_dev) {
+                s_dev->Activate(IID_IAudioMeterInformation_Local, CLSCTX_INPROC_SERVER, NULL, (void**)&s_meter);
+            }
+        }
+    }
+
+    float peak = 0.0f;
+    if (s_meter) {
+        if (FAILED(s_meter->GetPeakValue(&peak))) {
+            s_meter->Release();
+            s_meter = nullptr;
+            peak = 0.0f;
+        }
+    }
+    return std::clamp(peak, 0.0f, 1.0f);
+}
+
+void TelemetryEngine::MediaPlayPause() {
+    m_pendingMediaCmd.store(1, std::memory_order_relaxed);
+}
+
+void TelemetryEngine::MediaPrevTrack() {
+    m_pendingMediaCmd.store(2, std::memory_order_relaxed);
+}
+
+void TelemetryEngine::MediaNextTrack() {
+    m_pendingMediaCmd.store(3, std::memory_order_relaxed);
+}
+
+void TelemetryEngine::MediaSeekRelative(int deltaSec) {
+    m_pendingSeekArg.store(deltaSec, std::memory_order_relaxed);
+    m_pendingMediaCmd.store(4, std::memory_order_relaxed);
+}
+
+void TelemetryEngine::MediaSeekToRatio(float ratio01) {
+    int scaled = (int)std::round(std::clamp(ratio01, 0.0f, 1.0f) * 10000.0f);
+    m_pendingSeekArg.store(scaled, std::memory_order_relaxed);
+    m_pendingMediaCmd.store(5, std::memory_order_relaxed);
+}
+
+void TelemetryEngine::MediaCycleSession() {
+    int cur = m_preferredSessionIdx.load(std::memory_order_relaxed);
+    m_preferredSessionIdx.store(cur < 0 ? 1 : (cur + 1), std::memory_order_relaxed);
+    m_pendingMediaCmd.store(6, std::memory_order_relaxed);
+}
+
+void TelemetryEngine::SetPreviewMockMedia(bool enable) {
+    m_mockMediaPreview.store(enable, std::memory_order_relaxed);
+}
+
+static void SendMediaKeyFallback(BYTE vk) {
+    INPUT inputs[2] = {};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = vk;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = vk;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, inputs, sizeof(INPUT));
+}
+
+void TelemetryEngine::UpdateMediaAndAudio() {
+    float curPeak = PollAudioPeakFast();
+
+    int cmd = m_pendingMediaCmd.exchange(0, std::memory_order_relaxed);
+    int seekArg = m_pendingSeekArg.load(std::memory_order_relaxed);
+
+    bool foundSession = false;
+    bool isPlaying = false;
+    int sessionCount = 0;
+    int selectedIdx = 0;
+    std::wstring title;
+    std::wstring artist;
+    std::wstring sourceName;
+    int posSec = 0;
+    int durSec = 0;
+
+    if (!m_mockMediaPreview.load(std::memory_order_relaxed)) {
+        static CombaseRuntime s_rt;
+        thread_local bool tl_roInitDone = false;
+        if (!tl_roInitDone) {
+            if (s_rt.Init() && s_rt.pRoInitialize) {
+                s_rt.pRoInitialize(RO_INIT_MULTITHREADED);
+            }
+            tl_roInitDone = true;
+        }
+
+        if (s_rt.pRoGetActivationFactory && s_rt.pWindowsCreateString) {
+        const wchar_t* className = L"Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager";
+        HSTRING hsClass = NULL;
+        if (SUCCEEDED(s_rt.pWindowsCreateString(className, (UINT32)wcslen(className), &hsClass)) && hsClass) {
+            WinRT_IGSMTCSessionManagerStatics* statics = nullptr;
+            if (SUCCEEDED(s_rt.pRoGetActivationFactory(hsClass, IID_IGSMTCSessionManagerStatics, (void**)&statics)) && statics) {
+                WinRT_IAsyncOperationPtr* reqOp = nullptr;
+                if (SUCCEEDED(statics->RequestAsync(&reqOp)) && reqOp) {
+                    if (s_rt.WaitAsyncOp(reqOp, 250)) {
+                        WinRT_IGSMTCSessionManager* mgr = nullptr;
+                        if (SUCCEEDED(reqOp->GetResults((void**)&mgr)) && mgr) {
+                            WinRT_IVectorViewPtr* sessionsVec = nullptr;
+                            if (SUCCEEDED(mgr->GetSessions(&sessionsVec)) && sessionsVec) {
+                                UINT32 count = 0;
+                                sessionsVec->get_Size(&count);
+                                sessionCount = (int)count;
+
+                                std::vector<WinRT_IGSMTCSession*> sessions;
+                                int playingIdx = -1;
+
+                                for (UINT32 i = 0; i < count; ++i) {
+                                    WinRT_IGSMTCSession* s = nullptr;
+                                    if (SUCCEEDED(sessionsVec->GetAt(i, (void**)&s)) && s) {
+                                        sessions.push_back(s);
+                                        WinRT_IGSMTCPlaybackInfo* pbInfo = nullptr;
+                                        if (SUCCEEDED(s->GetPlaybackInfo(&pbInfo)) && pbInfo) {
+                                            INT32 status = 0;
+                                            pbInfo->get_PlaybackStatus(&status);
+                                            if (status == 4 && playingIdx < 0) { // 4 == Playing
+                                                playingIdx = (int)sessions.size() - 1;
+                                            }
+                                            pbInfo->Release();
+                                        }
+                                    }
+                                }
+
+                                if (!sessions.empty()) {
+                                    int pref = m_preferredSessionIdx.load(std::memory_order_relaxed);
+                                    if (pref >= 0) {
+                                        selectedIdx = pref % (int)sessions.size();
+                                    } else if (playingIdx >= 0) {
+                                        selectedIdx = playingIdx;
+                                    } else {
+                                        selectedIdx = 0;
+                                    }
+
+                                    WinRT_IGSMTCSession* activeSession = sessions[selectedIdx];
+
+                                    // 1. Read Source App Name
+                                    HSTRING hsApp = NULL;
+                                    if (SUCCEEDED(activeSession->get_SourceAppUserModelId(&hsApp))) {
+                                        sourceName = FormatMediaSourceName(s_rt.HStringToWide(hsApp));
+                                    }
+
+                                    // 2. Read Playback Status
+                                    WinRT_IGSMTCPlaybackInfo* pbInfo = nullptr;
+                                    if (SUCCEEDED(activeSession->GetPlaybackInfo(&pbInfo)) && pbInfo) {
+                                        INT32 status = 0;
+                                        pbInfo->get_PlaybackStatus(&status);
+                                        isPlaying = (status == 4);
+                                        pbInfo->Release();
+                                    }
+
+                                    // 3. Read Timeline Properties (with live interpolation when Playing)
+                                    INT64 startTicks = 0, endTicks = 0, posTicks = 0, lastUpdTicks = 0;
+                                    WinRT_IGSMTCTimelineProperties* tl = nullptr;
+                                    if (SUCCEEDED(activeSession->GetTimelineProperties(&tl)) && tl) {
+                                        tl->get_StartTime(&startTicks);
+                                        tl->get_EndTime(&endTicks);
+                                        tl->get_Position(&posTicks);
+                                        tl->get_LastUpdatedTime(&lastUpdTicks);
+                                        tl->Release();
+
+                                        if (endTicks > startTicks) {
+                                            durSec = (int)((endTicks - startTicks) / 10000000LL);
+                                            INT64 curTicks = posTicks;
+                                            if (isPlaying && lastUpdTicks > 0) {
+                                                FILETIME ftNow;
+                                                GetSystemTimeAsFileTime(&ftNow);
+                                                INT64 nowTicks = (INT64)FileTimeToU64(ftNow);
+                                                INT64 elapsed = nowTicks - lastUpdTicks;
+                                                if (elapsed > 0 && elapsed < 3600LL * 10000000LL) {
+                                                    curTicks = std::min(endTicks, posTicks + elapsed);
+                                                }
+                                            }
+                                            posSec = std::clamp((int)((curTicks - startTicks) / 10000000LL), 0, durSec);
+                                        }
+                                    }
+
+                                    // 4. Execute any pending user control command on activeSession
+                                    if (cmd == 1) { // Play/Pause
+                                        WinRT_IAsyncOperationBool* op = nullptr;
+                                        if (SUCCEEDED(activeSession->TryTogglePlayPauseAsync(&op)) && op) {
+                                            s_rt.WaitAsyncOp(op, 120);
+                                            op->Release();
+                                            isPlaying = !isPlaying;
+                                        } else {
+                                            SendMediaKeyFallback(VK_MEDIA_PLAY_PAUSE);
+                                        }
+                                    } else if (cmd == 2) { // Previous Track
+                                        WinRT_IAsyncOperationBool* op = nullptr;
+                                        if (SUCCEEDED(activeSession->TrySkipPreviousAsync(&op)) && op) {
+                                            s_rt.WaitAsyncOp(op, 120);
+                                            op->Release();
+                                        } else {
+                                            SendMediaKeyFallback(VK_MEDIA_PREV_TRACK);
+                                        }
+                                    } else if (cmd == 3) { // Next Track
+                                        WinRT_IAsyncOperationBool* op = nullptr;
+                                        if (SUCCEEDED(activeSession->TrySkipNextAsync(&op)) && op) {
+                                            s_rt.WaitAsyncOp(op, 120);
+                                            op->Release();
+                                        } else {
+                                            SendMediaKeyFallback(VK_MEDIA_NEXT_TRACK);
+                                        }
+                                    } else if (cmd == 4 && durSec > 0) { // Seek Relative (deltaSec)
+                                        int targetSec = std::clamp(posSec + seekArg, 0, durSec);
+                                        INT64 targetTicks = startTicks + (INT64)targetSec * 10000000LL;
+                                        WinRT_IAsyncOperationBool* op = nullptr;
+                                        if (SUCCEEDED(activeSession->TryChangePlaybackPositionAsync(targetTicks, &op)) && op) {
+                                            s_rt.WaitAsyncOp(op, 120);
+                                            op->Release();
+                                            posSec = targetSec;
+                                        }
+                                    } else if (cmd == 5 && durSec > 0) { // Seek to Ratio (0..10000)
+                                        int targetSec = std::clamp((int)std::round((seekArg / 10000.0f) * durSec), 0, durSec);
+                                        INT64 targetTicks = startTicks + (INT64)targetSec * 10000000LL;
+                                        WinRT_IAsyncOperationBool* op = nullptr;
+                                        if (SUCCEEDED(activeSession->TryChangePlaybackPositionAsync(targetTicks, &op)) && op) {
+                                            s_rt.WaitAsyncOp(op, 120);
+                                            op->Release();
+                                            posSec = targetSec;
+                                        }
+                                    }
+
+                                    // 5. Read Media Properties (Title, Artist, Thumbnail)
+                                    WinRT_IAsyncOperationPtr* propOp = nullptr;
+                                    if (SUCCEEDED(activeSession->TryGetMediaPropertiesAsync(&propOp)) && propOp) {
+                                        if (s_rt.WaitAsyncOp(propOp, 200)) {
+                                            WinRT_IGSMTCMediaProperties* mediaProps = nullptr;
+                                            if (SUCCEEDED(propOp->GetResults((void**)&mediaProps)) && mediaProps) {
+                                                HSTRING hsTitle = NULL, hsArtist = NULL, hsAlbumArtist = NULL;
+                                                if (SUCCEEDED(mediaProps->get_Title(&hsTitle))) title = TrimWide(s_rt.HStringToWide(hsTitle));
+                                                if (SUCCEEDED(mediaProps->get_Artist(&hsArtist))) artist = TrimWide(s_rt.HStringToWide(hsArtist));
+                                                if (artist.empty() && SUCCEEDED(mediaProps->get_AlbumArtist(&hsAlbumArtist))) {
+                                                    artist = TrimWide(s_rt.HStringToWide(hsAlbumArtist));
+                                                }
+
+                                                if (!title.empty()) {
+                                                    foundSession = true;
+                                                    std::wstring trackKey = sourceName + L"|" + title + L"|" + artist;
+                                                    if (trackKey != m_lastMediaTrackKey) {
+                                                        m_lastMediaTrackKey = trackKey;
+                                                        bool decoded = false;
+                                                        WinRT_IRandomAccessStreamReference* thumbRef = nullptr;
+                                                        if (SUCCEEDED(mediaProps->get_Thumbnail(&thumbRef)) && thumbRef) {
+                                                            decoded = DecodeThumbnailToBgra48(s_rt, thumbRef, m_cachedArtBgra, m_cachedArtW, m_cachedArtH);
+                                                            thumbRef->Release();
+                                                        }
+                                                        if (!decoded) {
+                                                            GenerateProceduralSourceArt(sourceName, m_cachedArtBgra, m_cachedArtW, m_cachedArtH);
+                                                        }
+                                                        m_albumArtVerCounter++;
+                                                    }
+                                                }
+                                                mediaProps->Release();
+                                            }
+                                        }
+                                        propOp->Release();
+                                    }
+
+                                    for (auto* s : sessions) s->Release();
+                                }
+                                sessionsVec->Release();
+                            }
+                            mgr->Release();
+                        }
+                    }
+                    reqOp->Release();
+                }
+                statics->Release();
+            }
+            s_rt.pWindowsDeleteString(hsClass);
+        }
+        }
+    }
+
+    // Fallback media key if no GSMTC session was found but user triggered Play/Prev/Next
+    if (!foundSession && (cmd >= 1 && cmd <= 3)) {
+        if (cmd == 1) SendMediaKeyFallback(VK_MEDIA_PLAY_PAUSE);
+        else if (cmd == 2) SendMediaKeyFallback(VK_MEDIA_PREV_TRACK);
+        else if (cmd == 3) SendMediaKeyFallback(VK_MEDIA_NEXT_TRACK);
+    }
+
+    // Support mock media preview for headless --verify screenshots when no real player is open
+    if (!foundSession && m_mockMediaPreview.load(std::memory_order_relaxed)) {
+        foundSession = true;
+        isPlaying = true;
+        sessionCount = 2;
+        selectedIdx = 0;
+        sourceName = L"Spotify";
+        title = L"Midnight City — M83";
+        artist = L"Hurry Up, We're Dreaming";
+        posSec = 84;
+        durSec = 243;
+        curPeak = 0.68f;
+        if (m_lastMediaTrackKey != L"MOCK_PREVIEW") {
+            m_lastMediaTrackKey = L"MOCK_PREVIEW";
+            GenerateProceduralSourceArt(sourceName, m_cachedArtBgra, m_cachedArtW, m_cachedArtH);
+            m_albumArtVerCounter++;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_snapshot.hasMediaSession = foundSession;
+        m_snapshot.mediaIsPlaying = isPlaying;
+        m_snapshot.mediaSessionCount = sessionCount;
+        m_snapshot.mediaActiveSessionIdx = selectedIdx;
+        m_snapshot.mediaTitle = title;
+        m_snapshot.mediaArtist = artist;
+        m_snapshot.mediaSourceName = sourceName;
+        m_snapshot.mediaPosSec = posSec;
+        m_snapshot.mediaDurSec = durSec;
+        m_snapshot.audioPeak = curPeak;
+        m_snapshot.hasAlbumArt = (foundSession && !m_cachedArtBgra.empty());
+        if (m_snapshot.albumArtVer != m_albumArtVerCounter) {
+            m_snapshot.albumArtVer = m_albumArtVerCounter;
+            m_snapshot.albumArtW = m_cachedArtW;
+            m_snapshot.albumArtH = m_cachedArtH;
+            m_snapshot.albumArtBgra = m_cachedArtBgra;
+        }
+    }
 }

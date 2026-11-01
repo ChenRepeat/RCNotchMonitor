@@ -101,8 +101,6 @@ static void ShowTrayContextMenu(HWND hwnd) {
     if (!hMenu || !g_pConfig) return;
 
     AppendMenuW(hMenu, MF_STRING, ID_TRAY_SETTINGS, L"⚙ 開啟外觀與欄位設定 (Ctrl+Alt+S)");
-    AppendMenuW(hMenu, MF_STRING, ID_TRAY_LAYOUT,
-                (g_pConfig->layoutMode == 0) ? L"⇄ 切換為「單行橫條模式」" : L"⇄ 切換為「雙行網格模式」");
     AppendMenuW(hMenu, MF_STRING | (g_pConfig->clickThroughLocked ? MF_CHECKED : 0),
                 ID_TRAY_LOCK, L"🔒 鎖定滑鼠穿透 (Ctrl+Alt+N)");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
@@ -176,8 +174,22 @@ static void LogStep(const std::wstring& outDir, const char* step) {
     }
 }
 
+static LONG WINAPI VerifyVeh(PEXCEPTION_POINTERS pEx) {
+    if (pEx && pEx->ExceptionRecord && pEx->ExceptionRecord->ExceptionCode >= 0x80000000) {
+        FILE* fp = _wfopen(L"C:\\Users\\User\\.gemini\\antigravity\\scratch\\win-notch-monitor\\verify_out\\verify_trace.txt", L"ab");
+        if (fp) {
+            fprintf(fp, "  [VEH] code=0x%08lX addr=%p\n",
+                    (unsigned long)pEx->ExceptionRecord->ExceptionCode,
+                    pEx->ExceptionRecord->ExceptionAddress);
+            fclose(fp);
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static int RunSelfVerification(HINSTANCE hInstance, const std::wstring& outDir) {
     CreateDirectoryW(outDir.c_str(), NULL);
+    AddVectoredExceptionHandler(1, VerifyVeh);
     LogStep(outDir, "1. Start RunSelfVerification");
 
     AppConfig config;
@@ -186,18 +198,16 @@ static int RunSelfVerification(HINSTANCE hInstance, const std::wstring& outDir) 
     config.LoadFromFile(cfgPath);
     LogStep(outDir, "2. Config saved and loaded");
 
-    TelemetryEngine telemetry;
+    TelemetryEngine telemetry(true);
     LogStep(outDir, "3. TelemetryEngine constructed");
-    telemetry.Start(250);
-    LogStep(outDir, "4. TelemetryEngine started");
-    Sleep(900); // Allow CPU delta, NVML, and LHM shared memory to populate
+    telemetry.SetPreviewMockMedia(true);
     telemetry.PollOnce();
     TelemetrySnapshot snap = telemetry.GetSnapshot();
-    LogStep(outDir, "5. Telemetry snapshot polled");
+    LogStep(outDir, "4. Telemetry snapshot polled");
 
     NotchWindow notch;
     bool notchOk = notch.Create(hInstance, &config, &telemetry);
-    LogStep(outDir, notchOk ? "6. NotchWindow created OK" : "6. NotchWindow FAILED");
+    LogStep(outDir, notchOk ? "5. NotchWindow created OK" : "5. NotchWindow FAILED");
 
     // 1. Save Dual-Row Collapsed Preview (Resolution-scaled default)
     config.layoutMode = 0;
@@ -335,14 +345,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     // Handle automated verification mode (--verify <dir>)
     size_t verifyPos = cmdLine.find(L"--verify");
     if (verifyPos != std::wstring::npos) {
-        std::wstring outDir = L"verify_out";
+        std::wstring outDir = L"C:\\Users\\User\\.gemini\\antigravity\\scratch\\win-notch-monitor\\verify_out";
         size_t argPos = verifyPos + 8;
         while (argPos < cmdLine.size() && cmdLine[argPos] == L' ') argPos++;
         if (argPos < cmdLine.size()) {
-            outDir = cmdLine.substr(argPos);
-            // Strip quotes if any
-            if (!outDir.empty() && outDir.front() == L'"') outDir.erase(0, 1);
-            if (!outDir.empty() && outDir.back() == L'"') outDir.pop_back();
+            std::wstring rawArg = cmdLine.substr(argPos);
+            // Trim trailing and leading whitespace and quotes robustly
+            while (!rawArg.empty() && (rawArg.back() == L' ' || rawArg.back() == L'\t' || rawArg.back() == L'\r' || rawArg.back() == L'\n' || rawArg.back() == L'"')) {
+                rawArg.pop_back();
+            }
+            while (!rawArg.empty() && (rawArg.front() == L' ' || rawArg.front() == L'\t' || rawArg.front() == L'"')) {
+                rawArg.erase(0, 1);
+            }
+            if (!rawArg.empty()) {
+                outDir = rawArg;
+            }
         }
         return RunSelfVerification(hInstance, outDir);
     }

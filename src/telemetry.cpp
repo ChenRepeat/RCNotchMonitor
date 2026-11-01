@@ -240,13 +240,16 @@ struct PidExclusionCache {
 };
 static PidExclusionCache g_pidCache;
 
+static std::atomic<DWORD> g_targetGamePid{0};
+static std::atomic<uint64_t> g_lastPresentQpc{0};
+
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (!pEvent || !g_pEtwFrameCounter) return;
     DWORD pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == GetCurrentProcessId()) return;
 
-    // Filter out excluded desktop/system/browser processes
-    if (g_pidCache.IsPidExcluded(pid)) return;
+    DWORD target = g_targetGamePid.load(std::memory_order_relaxed);
+    if (target == 0 || pid != target) return;
 
     // Supported Presentation Start Events:
     // 42: DXGI Present_Start
@@ -254,6 +257,17 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     // 1:  D3D9 Present_Start
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
     if (id == 42 || id == 55 || id == 1) {
+        uint64_t qpc = 0;
+        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&qpc));
+
+        // Deduplication window: discard duplicate present markers within 0.8ms (supports up to 1250 FPS)
+        uint64_t lastQpc = g_lastPresentQpc.load(std::memory_order_relaxed);
+        uint64_t minInterval = (g_qpcFreq > 0) ? (g_qpcFreq / 1250) : 0;
+        if (minInterval > 0 && lastQpc > 0 && (qpc >= lastQpc) && (qpc - lastQpc) < minInterval) {
+            return; // Duplicate event in same present transaction
+        }
+        g_lastPresentQpc.store(qpc, std::memory_order_relaxed);
+
         g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -784,6 +798,22 @@ static bool IsForegroundWindowFullscreenGame(DWORD& outPid) {
     return isFullscreen;
 }
 
+static bool IsDesktopOrShellWindow(HWND hwnd) {
+    if (!hwnd) return true;
+    wchar_t cls[128] = {0};
+    if (GetClassNameW(hwnd, cls, 128) == 0) return false;
+    if (_wcsicmp(cls, L"Progman") == 0 ||
+        _wcsicmp(cls, L"WorkerW") == 0 ||
+        _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
+        _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+        _wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
+        _wcsicmp(cls, L"ImmersiveLauncher") == 0 ||
+        _wcsicmp(cls, L"ApplicationFrameWindow") == 0) {
+        return true;
+    }
+    return false;
+}
+
 void TelemetryEngine::UpdateFpsAndDisplay() {
     DEVMODEW dm = {};
     dm.dmSize = sizeof(dm);
@@ -796,6 +826,32 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         LARGE_INTEGER freq = {};
         QueryPerformanceFrequency(&freq);
         g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
+    }
+
+    HWND hwnd = GetForegroundWindow();
+    DWORD fgPid = 0;
+    if (hwnd) {
+        GetWindowThreadProcessId(hwnd, &fgPid);
+    }
+
+    DWORD currentSelfPid = GetCurrentProcessId();
+
+    // Foreground Game Detection:
+    if (fgPid != currentSelfPid) {
+        if (!hwnd || fgPid == 0 || IsDesktopOrShellWindow(hwnd)) {
+            // User is on desktop or Windows taskbar -> no active game
+            g_targetGamePid.store(0, std::memory_order_relaxed);
+        } else {
+            wchar_t exeName[MAX_PATH] = {0};
+            bool hasExe = GetProcessExeName(fgPid, exeName, MAX_PATH);
+            if (hasExe && IsExcludedDesktopProcess(exeName)) {
+                // User is in browser, spotify, code editor, etc. -> no active game
+                g_targetGamePid.store(0, std::memory_order_relaxed);
+            } else {
+                // Foreground window belongs to a game (e.g. MonsterHunterWilds.exe)
+                g_targetGamePid.store(fgPid, std::memory_order_relaxed);
+            }
+        }
     }
 
     uint64_t nowQpc = 0;
@@ -811,7 +867,9 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             uint32_t frames = m_etwFrameCount.exchange(0, std::memory_order_relaxed);
             m_lastFpsQpc = nowQpc;
 
-            if (frames > 0 && elapsedSec > 0.0) {
+            DWORD currentTarget = g_targetGamePid.load(std::memory_order_relaxed);
+
+            if (currentTarget != 0 && frames > 0 && elapsedSec > 0.0) {
                 float rawFps = static_cast<float>(static_cast<double>(frames) / elapsedSec);
                 if (rawFps >= 10.0f) {
                     int rounded = static_cast<int>(std::round(rawFps));

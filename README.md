@@ -17,7 +17,7 @@
 
 ---
 
-## 📸 介面預覽 (Screenshots)
+## 介面預覽 (Screenshots)
 
 ### 1. 收合狀態：雙行網格模式 (Dual-Row) vs 單行橫條模式 (Single-Row)
 
@@ -48,7 +48,7 @@
 
 ---
 
-## ✨ 核心功能與設計亮點
+## 核心功能與設計亮點
 
 ### 1. 原生硬體遙測引擎 (Zero-Bloat Telemetry Engine)
 背景採用獨立低優先權採樣執行緒，完全不阻塞 UI 渲染，支援以下四大硬體指標：
@@ -70,12 +70,12 @@
 ### 3. 無邊框自訂設定視窗 (Custom-Framed Settings UI)
 - **拖曳排序 (Drag-to-Reorder)**：按住每列右側的 6 點拖曳把手（自動切換為 `IDC_SIZEALL` 十字移動游標）即可上下拖曳調整 CPU / GPU / RAM / FPS 的顯示順序，其他列會以 **60FPS 補幀動畫**平滑讓位。
 - **雙模式溫度閾值設定**：「警戒溫度」與「高溫溫度」除了可點擊上下箭頭快速微調外，亦可直接點擊數值框以鍵盤輸入任意溫度（`30°C` ~ `110°C`）。
-- **黑白極簡預設與全自訂配色**：預設採用極簡黑底白字懸停風格（擺脫廉價螢光藍），並支援透過 Windows 調色盤自訂「底色」、「邊框」、「按鈕」、「懸停」以及每個監控項目的「標題色」與「數值色」。
+- **黑白極簡預設與全自訂配色**：預設採用極簡黑底白字懸停風格，並支援透過 Windows 調色盤自訂「底色」、「邊框」、「按鈕」、「懸停」以及每個監控項目的「標題色」與「數值色」。
 - **開機管理員自啟**：內建 Windows 工作排程器（`Task Scheduler`）整合，開啟「開機自啟」後於登入時自動以最高權限背景啟動，免除每次開機彈出 UAC 提示。
 
 ---
 
-## ⌨️ 快捷鍵與滑鼠操作
+## 快捷鍵與滑鼠操作
 
 | 操作方式 | 觸發位置 | 功能說明 |
 | :--- | :--- | :--- |
@@ -88,7 +88,7 @@
 
 ---
 
-## 📂 專案目錄結構
+## 專案目錄結構
 
 ```text
 RCNotchMonitor/
@@ -106,7 +106,7 @@ RCNotchMonitor/
 │   ├── fa_icons.h               # 純幾何向量繪製之 Font Awesome 風格圖示庫與 4 點旋轉補幀渲染器
 │   ├── sensor_bridge.cs         # 選用之硬體溫度感測橋接模組
 │   ├── app.ico                  # 多解析度 (16x16 ~ 256x256) 應用程式圖示
-│   └── app.rc                   # Windows 資源檔 (内嵌圖示與 VS_VERSION_INFO 發行者資訊)
+│   └── app.rc                   # Windows 資源檔 (內嵌圖示與 VS_VERSION_INFO 發行者資訊)
 ├── build.ps1                    # 一鍵編譯腳本 (支援本機 w64devkit 與 GitHub Actions MinGW-w64)
 ├── .gitignore                   # Git 忽略規則
 ├── LICENSE                      # MIT 開源授權條款
@@ -115,7 +115,7 @@ RCNotchMonitor/
 
 ---
 
-## 🛠️ 從原始碼編譯 (Build from Source)
+## 從原始碼編譯 (Build from Source)
 
 ### 系統與編譯器需求
 - **作業系統**：Windows 10 / Windows 11 (64-bit)
@@ -143,7 +143,7 @@ dist\RCNotchMonitor.exe
 
 ---
 
-## ⚙️ 設定檔結構 (`config.json`)
+## 設定檔結構 (`config.json`)
 
 程式會在執行檔同目錄下自動產生並讀取 `config.json`，所有像素與比例數值均對齊為 `4` 的倍數：
 
@@ -171,7 +171,7 @@ dist\RCNotchMonitor.exe
 
 ---
 
-## 🔐 Code Signing Policy
+## Code Signing Policy
 
 Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
@@ -181,6 +181,6 @@ Free code signing provided by [SignPath.io](https://signpath.io/), certificate b
 
 ---
 
-## 📄 授權條款 (License)
+## 授權條款 (License)
 
-本專案採用 [MIT License](LICENSE) 授權開源。歡迎自由 Fork、提交 Issue 或 Pull Request！
+本專案採用 [MIT License](LICENSE) 授權開源。歡迎自由 Fork、提交 Issue 或 Pull Request。

@@ -96,6 +96,10 @@ private:
     void InitCpuInfo();
     void InitNvml();
     void ShutdownNvml();
+    void InitAdl();
+    void ShutdownAdl();
+    void InitDxgi();
+    void ShutdownDxgi();
     void LaunchSensorBridge();
     void ReadSharedMemory(ShmSensorData& outShm, bool& valid);
     void UpdateCpuAndRam(const ShmSensorData& shm, bool shmValid);
@@ -124,16 +128,32 @@ private:
     void* m_nvmlDevice = nullptr;
     bool m_nvmlReady = false;
 
+    // AMD ADL dynamic bindings
+    HMODULE m_hAdl = NULL;
+    void* m_adlContext = nullptr;
+    int m_amdAdapterIndex = -1;
+    std::wstring m_amdGpuName = L"AMD Radeon Graphics";
+    bool m_adlReady = false;
+
+    // DXGI 1.4 for Video Memory Query
+    void* m_dxgiFactory = nullptr;
+    void* m_dxgiAdapter3 = nullptr;
+    bool m_dxgiReady = false;
+
     // Shared memory & SensorBridge child process
     HANDLE m_hMapFile = NULL;
     void* m_pShmBuf = nullptr;
     HANDLE m_hJobObject = NULL;
     HANDLE m_hBridgeProcess = NULL;
 
-    // ETW FPS state
+    // ETW FPS & Anti-Flicker state
     std::atomic<uint32_t> m_etwFrameCount{0};
     uint64_t m_lastFpsCalcTick = 0;
     int m_lastComputedFps = 0;
+    float m_smoothedFps = 0.0f;
+    int m_stableFps = 0;
+    int m_zeroFpsStreak = 0;
+    int m_activeFpsStreak = 0;
 
     // Media & Audio state
     std::atomic<int> m_preferredSessionIdx{-1}; // -1 = auto-select Playing session

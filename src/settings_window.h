@@ -41,6 +41,7 @@ private:
     void RenderToTarget(ID2D1RenderTarget* rt, int w, int h);
     void HandleZoneClick(int zoneId, float mx, float my, const D2D1_RECT_F& rc);
     void CommitTempEdit();
+    void CommitScaleEdit();
     void NotifyChanged(bool saveToDisk = true);
     bool PickColor(COLORREF& ioColor);
     void ApplyAutoStartTask(bool enable);
@@ -72,6 +73,10 @@ private:
     int m_focusedTitleRow = -1;   // 0..3 when typing custom metric title
     int m_focusedTempIdx = -1;    // 0 = Warn temp, 1 = Crit temp
     std::wstring m_tempEditStr;
+
+    // Direct scale percentage input
+    bool m_editingScale = false;
+    std::wstring m_scaleEditStr;
 
     // Animation state for 4-dot layout icon & 2D visual block drag-and-drop canvas
     float m_layoutAnim = 0.0f;    // 0.0 = Dual-Row (2x2), 1.0 = Single-Row (1x4)

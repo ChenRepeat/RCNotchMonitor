@@ -8,6 +8,7 @@
 #include <psapi.h>
 #include <evntrace.h>
 #include <evntcons.h>
+#include <dxgi1_4.h>
 #include <cmath>
 #include <cstring>
 #include <cwctype>
@@ -50,6 +51,97 @@ static PFN_nvmlDeviceGetTemperature fn_nvmlGetTemp = nullptr;
 static PFN_nvmlDeviceGetMemoryInfo fn_nvmlGetMem = nullptr;
 static PFN_nvmlDeviceGetPowerUsage fn_nvmlGetPower = nullptr;
 
+// AMD ADL function pointer typedefs and structures
+typedef void* (*ADL_MAIN_MALLOC_CALLBACK)(int);
+static void* __stdcall AdlAlloc(int iSize) { return malloc(iSize); }
+
+typedef int (*ADL2_MAIN_CONTROL_CREATE)(ADL_MAIN_MALLOC_CALLBACK, int, void**);
+typedef int (*ADL2_MAIN_CONTROL_DESTROY)(void*);
+typedef int (*ADL2_ADAPTER_NUMBEROFADAPTERS_GET)(void*, int*);
+
+struct AdapterInfo {
+    int iSize;
+    int iAdapterIndex;
+    char strUDID[256];
+    int iBusNumber;
+    int iDeviceNumber;
+    int iFunctionNumber;
+    int iVendorID;
+    char strAdapterName[256];
+    char strDisplayName[256];
+    int iPresent;
+    int iExist;
+    char strDriverPath[256];
+    char strDriverPathExt[256];
+    char strPNPString[256];
+    int iOSDisplayIndex;
+};
+typedef int (*ADL2_ADAPTER_ADAPTERINFO_GET)(void*, AdapterInfo*, int);
+
+struct ADLODNPerformanceStatus {
+    int iCoreClock;
+    int iMemoryClock;
+    int iDCEFClock;
+    int iGFXClock;
+    int iUVDClock;
+    int iVCEClock;
+    int iGPUActivityPercent;
+    int iCurrentPerformanceLevel;
+    int iCurrentBusSpeed;
+    int iCurrentBusLanes;
+    int iMaximumBusLanes;
+    int iVDDC;
+    int iVDDCI;
+};
+typedef int (*ADL2_OVERDRIVEN_PERFORMANCESTATUS_GET)(void*, int, ADLODNPerformanceStatus*);
+typedef int (*ADL2_OVERDRIVEN_TEMPERATURE_GET)(void*, int, int, int*);
+typedef int (*ADL2_OVERDRIVE6_CURRENTPOWER_GET)(void*, int, int, int*);
+
+struct ADLOD6CurrentStatus {
+    int iEngineClock;
+    int iMemoryClock;
+    int iActivityPercent;
+    int iCurrentPerformanceLevel;
+    int iCurrentBusSpeed;
+    int iCurrentBusLanes;
+    int iMaximumBusLanes;
+    int iReserved;
+};
+typedef int (*ADL2_OVERDRIVE6_CURRENTSTATUS_GET)(void*, int, ADLOD6CurrentStatus*);
+typedef int (*ADL2_OVERDRIVE6_TEMPERATURE_GET)(void*, int, int*);
+
+struct ADLTemperature {
+    int iSize;
+    int iTemperature;
+};
+typedef int (*ADL_OVERDRIVE5_TEMPERATURE_GET)(int, int, ADLTemperature*);
+
+struct ADLPMActivity {
+    int iSize;
+    int iEngineClock;
+    int iMemoryClock;
+    int iVddc;
+    int iActivityPercent;
+    int iCurrentPerformanceLevel;
+    int iCurrentBusSpeed;
+    int iCurrentBusLanes;
+    int iMaximumBusLanes;
+    int iReserved;
+};
+typedef int (*ADL_OVERDRIVE5_CURRENTACTIVITY_GET)(int, ADLPMActivity*);
+
+static ADL2_MAIN_CONTROL_CREATE fn_adl2Create = nullptr;
+static ADL2_MAIN_CONTROL_DESTROY fn_adl2Destroy = nullptr;
+static ADL2_ADAPTER_NUMBEROFADAPTERS_GET fn_adl2NumAdapters = nullptr;
+static ADL2_ADAPTER_ADAPTERINFO_GET fn_adl2AdapterInfo = nullptr;
+static ADL2_OVERDRIVEN_PERFORMANCESTATUS_GET fn_adl2OverdriveNPerf = nullptr;
+static ADL2_OVERDRIVEN_TEMPERATURE_GET fn_adl2OverdriveNTemp = nullptr;
+static ADL2_OVERDRIVE6_CURRENTPOWER_GET fn_adl2Overdrive6Power = nullptr;
+static ADL2_OVERDRIVE6_CURRENTSTATUS_GET fn_adl2Overdrive6Status = nullptr;
+static ADL2_OVERDRIVE6_TEMPERATURE_GET fn_adl2Overdrive6Temp = nullptr;
+static ADL_OVERDRIVE5_CURRENTACTIVITY_GET fn_adlOverdrive5Activity = nullptr;
+static ADL_OVERDRIVE5_TEMPERATURE_GET fn_adlOverdrive5Temp = nullptr;
+
 static std::wstring AnsiToWide(const char* s) {
     if (!s || !*s) return L"";
     int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
@@ -73,6 +165,8 @@ static uint64_t FileTimeToU64(const FILETIME& ft) {
 // Global pointer for ETW callback
 static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 static std::atomic<DWORD> g_foregroundPid{0};
+static std::atomic<DWORD> g_excludedPid{0};
+static std::atomic<bool> g_isFgGameCandidate{false};
 static TRACEHANDLE g_hTraceSession = 0;
 static TRACEHANDLE g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
 static std::thread g_etwThread;
@@ -83,10 +177,52 @@ static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xA
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
 
+static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
+    if (!exeName || !*exeName) return false;
+    static const wchar_t* const s_excluded[] = {
+        L"explorer.exe", L"dwm.exe", L"shellexperiencehost.exe", L"searchhost.exe",
+        L"taskmgr.exe", L"systemsettings.exe", L"applicationframehost.exe",
+        L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
+        L"code.exe", L"devenv.exe", L"notepad.exe", L"notepad++.exe", L"sublime_text.exe",
+        L"spotify.exe", L"discord.exe", L"slack.exe", L"teams.exe", L"steam.exe",
+        L"steamwebhelper.exe", L"epicgameslauncher.exe", L"galaxyclient.exe",
+        L"rcnotchmonitor.exe", L"win-notch-monitor.exe"
+    };
+    for (const auto* ex : s_excluded) {
+        if (_wcsicmp(exeName, ex) == 0) return true;
+    }
+    return false;
+}
+
+static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
+    if (pid == 0) return false;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return false;
+    DWORD len = maxLen;
+    BOOL ok = QueryFullProcessImageNameW(hProcess, 0, outName, &len);
+    CloseHandle(hProcess);
+    if (!ok) return false;
+    const wchar_t* p = wcsrchr(outName, L'\\');
+    if (p) {
+        wmemmove(outName, p + 1, (wcslen(p + 1) + 1) * sizeof(wchar_t));
+    }
+    return true;
+}
+
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (!pEvent || !g_pEtwFrameCounter) return;
+    DWORD pid = pEvent->EventHeader.ProcessId;
+    if (pid == 0 || pid == GetCurrentProcessId()) return;
+
+    DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
+    if (excluded != 0 && pid == excluded) return;
+
     DWORD fgPid = g_foregroundPid.load(std::memory_order_relaxed);
-    if (fgPid == 0 || pEvent->EventHeader.ProcessId != fgPid) return;
+    if (fgPid != 0 && pid != fgPid) {
+        if (!g_isFgGameCandidate.load(std::memory_order_relaxed)) {
+            return;
+        }
+    }
 
     // DXGI Present_Start is Event ID 42, D3D9 Present_Start is Event ID 1
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
@@ -100,6 +236,8 @@ TelemetryEngine::TelemetryEngine(bool verifyMockMode) {
     InitCpuInfo();
     if (!verifyMockMode) {
         InitNvml();
+        InitAdl();
+        InitDxgi();
         LaunchSensorBridge();
     } else {
         m_snapshot.gpuName = L"NVIDIA GeForce RTX 4070 SUPER";
@@ -124,6 +262,8 @@ TelemetryEngine::TelemetryEngine(bool verifyMockMode) {
 TelemetryEngine::~TelemetryEngine() {
     Stop();
     ShutdownNvml();
+    ShutdownAdl();
+    ShutdownDxgi();
     if (m_pShmBuf) {
         UnmapViewOfFile(m_pShmBuf);
         m_pShmBuf = nullptr;
@@ -205,6 +345,111 @@ void TelemetryEngine::ShutdownNvml() {
         FreeLibrary(m_hNvml);
         m_hNvml = NULL;
     }
+}
+
+void TelemetryEngine::InitAdl() {
+    m_hAdl = LoadLibraryA("atiadlxx.dll");
+    if (!m_hAdl) m_hAdl = LoadLibraryA("atiadlxy.dll");
+    if (!m_hAdl) return;
+
+    fn_adl2Create = (ADL2_MAIN_CONTROL_CREATE)GetProcAddress(m_hAdl, "ADL2_Main_Control_Create");
+    fn_adl2Destroy = (ADL2_MAIN_CONTROL_DESTROY)GetProcAddress(m_hAdl, "ADL2_Main_Control_Destroy");
+    fn_adl2NumAdapters = (ADL2_ADAPTER_NUMBEROFADAPTERS_GET)GetProcAddress(m_hAdl, "ADL2_Adapter_NumberOfAdapters_Get");
+    fn_adl2AdapterInfo = (ADL2_ADAPTER_ADAPTERINFO_GET)GetProcAddress(m_hAdl, "ADL2_Adapter_AdapterInfo_Get");
+    fn_adl2OverdriveNPerf = (ADL2_OVERDRIVEN_PERFORMANCESTATUS_GET)GetProcAddress(m_hAdl, "ADL2_OverdriveN_PerformanceStatus_Get");
+    fn_adl2OverdriveNTemp = (ADL2_OVERDRIVEN_TEMPERATURE_GET)GetProcAddress(m_hAdl, "ADL2_OverdriveN_Temperature_Get");
+    fn_adl2Overdrive6Power = (ADL2_OVERDRIVE6_CURRENTPOWER_GET)GetProcAddress(m_hAdl, "ADL2_Overdrive6_CurrentPower_Get");
+    fn_adl2Overdrive6Status = (ADL2_OVERDRIVE6_CURRENTSTATUS_GET)GetProcAddress(m_hAdl, "ADL2_Overdrive6_CurrentStatus_Get");
+    fn_adl2Overdrive6Temp = (ADL2_OVERDRIVE6_TEMPERATURE_GET)GetProcAddress(m_hAdl, "ADL2_Overdrive6_Temperature_Get");
+    fn_adlOverdrive5Activity = (ADL_OVERDRIVE5_CURRENTACTIVITY_GET)GetProcAddress(m_hAdl, "ADL_Overdrive5_CurrentActivity_Get");
+    fn_adlOverdrive5Temp = (ADL_OVERDRIVE5_TEMPERATURE_GET)GetProcAddress(m_hAdl, "ADL_Overdrive5_Temperature_Get");
+
+    if (!fn_adl2Create || fn_adl2Create(AdlAlloc, 1, &m_adlContext) != 0 || !m_adlContext) {
+        return;
+    }
+
+    if (fn_adl2NumAdapters && fn_adl2AdapterInfo) {
+        int nAdapters = 0;
+        if (fn_adl2NumAdapters(m_adlContext, &nAdapters) == 0 && nAdapters > 0) {
+            std::vector<AdapterInfo> adapters(nAdapters);
+            for (auto& a : adapters) a.iSize = sizeof(AdapterInfo);
+            if (fn_adl2AdapterInfo(m_adlContext, adapters.data(), sizeof(AdapterInfo) * nAdapters) == 0) {
+                for (int i = 0; i < nAdapters; ++i) {
+                    if (adapters[i].iPresent && adapters[i].iVendorID == 0x1002) {
+                        m_amdAdapterIndex = adapters[i].iAdapterIndex;
+                        m_amdGpuName = TrimWide(AnsiToWide(adapters[i].strAdapterName));
+                        m_adlReady = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void TelemetryEngine::ShutdownAdl() {
+    if (m_adlContext && fn_adl2Destroy) {
+        fn_adl2Destroy(m_adlContext);
+        m_adlContext = nullptr;
+    }
+    m_adlReady = false;
+    if (m_hAdl) {
+        FreeLibrary(m_hAdl);
+        m_hAdl = NULL;
+    }
+}
+
+void TelemetryEngine::InitDxgi() {
+    IDXGIFactory1* pFactory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory)) && pFactory) {
+        m_dxgiFactory = pFactory;
+        IDXGIAdapter1* pAdapter = nullptr;
+        IDXGIAdapter1* bestAdapter = nullptr;
+        SIZE_T bestVram = 0;
+
+        for (UINT i = 0; pFactory->EnumAdapters1(i, &pAdapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 d = {};
+            pAdapter->GetDesc1(&d);
+            if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+                pAdapter->Release();
+                continue;
+            }
+            if (d.DedicatedVideoMemory > bestVram || !bestAdapter) {
+                if (bestAdapter) bestAdapter->Release();
+                bestAdapter = pAdapter;
+                bestVram = d.DedicatedVideoMemory;
+            } else {
+                pAdapter->Release();
+            }
+        }
+
+        if (bestAdapter) {
+            IDXGIAdapter3* pAdapter3 = nullptr;
+            if (SUCCEEDED(bestAdapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&pAdapter3)) && pAdapter3) {
+                m_dxgiAdapter3 = pAdapter3;
+                m_dxgiReady = true;
+                if (!m_nvmlReady && !m_adlReady) {
+                    DXGI_ADAPTER_DESC1 d = {};
+                    bestAdapter->GetDesc1(&d);
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_snapshot.gpuName = d.Description;
+                }
+            }
+            bestAdapter->Release();
+        }
+    }
+}
+
+void TelemetryEngine::ShutdownDxgi() {
+    if (m_dxgiAdapter3) {
+        reinterpret_cast<IDXGIAdapter3*>(m_dxgiAdapter3)->Release();
+        m_dxgiAdapter3 = nullptr;
+    }
+    if (m_dxgiFactory) {
+        reinterpret_cast<IDXGIFactory1*>(m_dxgiFactory)->Release();
+        m_dxgiFactory = nullptr;
+    }
+    m_dxgiReady = false;
 }
 
 void TelemetryEngine::LaunchSensorBridge() {
@@ -348,6 +593,7 @@ void TelemetryEngine::UpdateCpuAndRam(const ShmSensorData& shm, bool shmValid) {
 }
 
 void TelemetryEngine::UpdateGpu(const ShmSensorData& shm, bool shmValid) {
+    // 1. If NVIDIA NVML is active
     if (m_nvmlReady && m_nvmlDevice) {
         nvmlUtilization_t util = {};
         unsigned int temp = 0;
@@ -369,7 +615,82 @@ void TelemetryEngine::UpdateGpu(const ShmSensorData& shm, bool shmValid) {
         return;
     }
 
-    // Fallback to LibreHardwareMonitor bridge for AMD / Intel GPUs
+    // 2. Native AMD GPU telemetry via ADL + DXGI 1.4
+    if (m_adlReady && m_adlContext && m_amdAdapterIndex >= 0) {
+        int gpuUsage = 0;
+        int gpuTemp = 0;
+        float gpuPower = 0.0f;
+
+        // Usage %
+        if (fn_adl2OverdriveNPerf) {
+            ADLODNPerformanceStatus st = {};
+            if (fn_adl2OverdriveNPerf(m_adlContext, m_amdAdapterIndex, &st) == 0 && st.iGPUActivityPercent >= 0) {
+                gpuUsage = std::clamp(st.iGPUActivityPercent, 0, 100);
+            }
+        }
+        if (gpuUsage == 0 && fn_adl2Overdrive6Status) {
+            ADLOD6CurrentStatus st6 = {};
+            if (fn_adl2Overdrive6Status(m_adlContext, m_amdAdapterIndex, &st6) == 0 && st6.iActivityPercent >= 0) {
+                gpuUsage = std::clamp(st6.iActivityPercent, 0, 100);
+            }
+        }
+        if (gpuUsage == 0 && fn_adlOverdrive5Activity) {
+            ADLPMActivity act5 = {};
+            act5.iSize = sizeof(ADLPMActivity);
+            if (fn_adlOverdrive5Activity(m_amdAdapterIndex, &act5) == 0 && act5.iActivityPercent >= 0) {
+                gpuUsage = std::clamp(act5.iActivityPercent, 0, 100);
+            }
+        }
+
+        // Temperature
+        int tempVal = 0;
+        if (fn_adl2OverdriveNTemp && fn_adl2OverdriveNTemp(m_adlContext, m_amdAdapterIndex, 1 /* Edge */, &tempVal) == 0 && tempVal > 0) {
+            gpuTemp = tempVal / 1000;
+        } else if (fn_adl2Overdrive6Temp && fn_adl2Overdrive6Temp(m_adlContext, m_amdAdapterIndex, &tempVal) == 0 && tempVal > 0) {
+            gpuTemp = tempVal / 1000;
+        } else if (fn_adlOverdrive5Temp) {
+            ADLTemperature t5 = {};
+            t5.iSize = sizeof(ADLTemperature);
+            if (fn_adlOverdrive5Temp(m_amdAdapterIndex, 0, &t5) == 0 && t5.iTemperature > 0) {
+                gpuTemp = t5.iTemperature / 1000;
+            }
+        }
+
+        // Power
+        if (fn_adl2Overdrive6Power) {
+            int powerMw = 0;
+            if (fn_adl2Overdrive6Power(m_adlContext, m_amdAdapterIndex, 0, &powerMw) == 0 && powerMw > 0) {
+                gpuPower = (float)powerMw / 1000.0f;
+            }
+        }
+
+        // VRAM from DXGI 1.4 QueryVideoMemoryInfo
+        float vramUsed = 0.0f;
+        float vramTotal = 0.0f;
+        if (m_dxgiReady && m_dxgiAdapter3) {
+            auto* pA3 = reinterpret_cast<IDXGIAdapter3*>(m_dxgiAdapter3);
+            DXGI_QUERY_VIDEO_MEMORY_INFO vInfo = {};
+            if (SUCCEEDED(pA3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vInfo))) {
+                vramUsed = (float)((double)vInfo.CurrentUsage / (1024.0 * 1024.0 * 1024.0));
+                vramTotal = (float)((double)vInfo.Budget / (1024.0 * 1024.0 * 1024.0));
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_amdGpuName.empty()) {
+            m_snapshot.gpuName = m_amdGpuName;
+        }
+        m_snapshot.gpuUsagePct = gpuUsage;
+        // On APUs without dedicated thermal controller, GPU die is unified with CPU package!
+        m_snapshot.gpuTempC = (gpuTemp > 0) ? gpuTemp : m_snapshot.cpuTempC;
+        m_snapshot.gpuVramUsedGb = vramUsed;
+        m_snapshot.gpuVramTotalGb = (vramTotal > 0.0f) ? vramTotal : 8.0f;
+        m_snapshot.gpuPowerW = gpuPower;
+        m_snapshot.gpuFromNvml = false;
+        return;
+    }
+
+    // 3. Fallback to LibreHardwareMonitor bridge or DXGI
     if (shmValid) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (shm.gpuName[0] != '\0') {
@@ -381,6 +702,21 @@ void TelemetryEngine::UpdateGpu(const ShmSensorData& shm, bool shmValid) {
         m_snapshot.gpuVramUsedGb = shm.gpuVramUsedGb;
         m_snapshot.gpuVramTotalGb = shm.gpuVramTotalGb;
         m_snapshot.gpuFromNvml = false;
+        return;
+    }
+
+    // 4. Fallback to DXGI alone if no other GPU sensors available
+    if (m_dxgiReady && m_dxgiAdapter3) {
+        auto* pA3 = reinterpret_cast<IDXGIAdapter3*>(m_dxgiAdapter3);
+        DXGI_QUERY_VIDEO_MEMORY_INFO vInfo = {};
+        if (SUCCEEDED(pA3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vInfo))) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_snapshot.gpuVramUsedGb = (float)((double)vInfo.CurrentUsage / (1024.0 * 1024.0 * 1024.0));
+            m_snapshot.gpuVramTotalGb = (float)((double)vInfo.Budget / (1024.0 * 1024.0 * 1024.0));
+            if (m_snapshot.gpuTempC == 0) {
+                m_snapshot.gpuTempC = m_snapshot.cpuTempC;
+            }
+        }
     }
 }
 
@@ -426,28 +762,56 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     }
 
     DWORD fgPid = 0;
-    bool isFullscreenGame = IsForegroundWindowFullscreenGame(fgPid);
+    HWND hwnd = GetForegroundWindow();
+    if (hwnd) {
+        GetWindowThreadProcessId(hwnd, &fgPid);
+    }
     g_foregroundPid.store(fgPid, std::memory_order_relaxed);
+
+    wchar_t exeName[MAX_PATH] = {0};
+    bool hasExe = GetProcessExeName(fgPid, exeName, MAX_PATH);
+    bool isExcluded = hasExe && IsExcludedDesktopProcess(exeName);
+    if (isExcluded) {
+        g_excludedPid.store(fgPid, std::memory_order_relaxed);
+        g_isFgGameCandidate.store(false, std::memory_order_relaxed);
+    } else {
+        g_isFgGameCandidate.store(fgPid != 0 && fgPid != GetCurrentProcessId(), std::memory_order_relaxed);
+    }
 
     uint64_t nowTick = GetTickCount64();
     uint64_t elapsedMs = nowTick - m_lastFpsCalcTick;
-    if (elapsedMs >= 500) {
+    float rawFps = 0.0f;
+    if (elapsedMs >= 350) {
         uint32_t frames = m_etwFrameCount.exchange(0, std::memory_order_relaxed);
-        if (frames > 0 && elapsedMs > 0) {
-            m_lastComputedFps = (int)std::round((double)frames * 1000.0 / (double)elapsedMs);
-        } else {
-            m_lastComputedFps = 0;
+        if (frames > 0 && elapsedMs > 0 && !isExcluded) {
+            rawFps = (float)((double)frames * 1000.0 / (double)elapsedMs);
         }
         m_lastFpsCalcTick = nowTick;
     }
 
+    // Anti-Flicker & Hysteresis Smoothing:
+    // Requires 2 consecutive ticks to enter game FPS, 3 consecutive zero ticks to exit to desktop standby
+    if (rawFps >= 12.0f && !isExcluded) {
+        m_activeFpsStreak++;
+        m_zeroFpsStreak = 0;
+        if (m_activeFpsStreak >= 2) {
+            if (m_smoothedFps <= 0.0f) m_smoothedFps = rawFps;
+            else m_smoothedFps = m_smoothedFps * 0.55f + rawFps * 0.45f;
+            m_stableFps = (int)std::round(m_smoothedFps);
+        }
+    } else {
+        m_activeFpsStreak = 0;
+        m_zeroFpsStreak++;
+        if (m_zeroFpsStreak >= 3) {
+            m_smoothedFps = 0.0f;
+            m_stableFps = 0;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
     m_snapshot.monitorRefreshHz = hz;
-    if (m_lastComputedFps > 5) {
-        m_snapshot.currentFps = m_lastComputedFps;
-        m_snapshot.isGameActive = true;
-    } else if (isFullscreenGame && m_snapshot.gpuUsagePct > 25) {
-        m_snapshot.currentFps = hz;
+    if (m_stableFps > 0) {
+        m_snapshot.currentFps = m_stableFps;
         m_snapshot.isGameActive = true;
     } else {
         m_snapshot.currentFps = 0;

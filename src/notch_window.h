@@ -84,7 +84,7 @@ private:
     float m_mediaDockAnim = 0.0f; // 0.0 = Docked Left, 1.0 = Docked Right
     float m_marqueeOffset = 0.0f; // Continuous horizontal scroll offset (px)
     float m_marqueePhase = 0.0f;
-    float m_audioBars[4] = { 0.18f, 0.28f, 0.22f, 0.16f };
+    float m_audioBars[6] = { 0.18f, 0.28f, 0.22f, 0.16f, 0.24f, 0.18f };
     float m_currW = 260.0f;
     float m_currH = 36.0f;
 

@@ -149,7 +149,7 @@ bool NotchWindow::Create(HINSTANCE hInstance, AppConfig* config, TelemetryEngine
     float wDual = 260.0f, hDual = 36.0f, wSingle = 396.0f, hSingle = 28.0f;
     GetDualAndSingleLogicalSize(m_config, wDual, hDual, wSingle, hSingle);
     float easeLayout = Smoothstep01(m_layoutAnim);
-    float medExtra = (160.0f + 16.0f * easeLayout) * Smoothstep01(m_mediaAnim);
+    float medExtra = (180.0f + 18.0f * easeLayout) * Smoothstep01(m_mediaAnim);
     m_currW = wDual + (wSingle - wDual) * easeLayout + medExtra;
     m_currH = hDual + (hSingle - hDual) * easeLayout;
     QueryPerformanceCounter(&m_lastTick);
@@ -435,19 +435,24 @@ void NotchWindow::OnTimerTick() {
 
     // Advance marquee & audio visualizer bars when media is visible
     if (m_mediaAnim > 0.01f) {
-        m_marqueePhase += dt * 36.0f; // 36 logical px/sec smooth marquee scroll
-        if (m_marqueePhase > 10000.0f) m_marqueePhase -= 10000.0f;
-        m_marqueeOffset = m_marqueePhase;
+        // Preference 3+1: When mouse expands the notch (or hovered), marquee scrolls even if paused (Mode 1).
+        // When outside / collapsed, paused state completely freezes marquee at current position (Mode 3).
+        bool shouldScrollMarquee = snap.mediaIsPlaying || (m_isHovered || m_animProgress > 0.05f);
+        if (shouldScrollMarquee) {
+            m_marqueePhase += dt * 36.0f; // 36 logical px/sec smooth marquee scroll
+            if (m_marqueePhase > 10000.0f) m_marqueePhase -= 10000.0f;
+            m_marqueeOffset = m_marqueePhase;
+        }
 
         float rawPeak = m_telemetry ? m_telemetry->PollAudioPeakFast() : snap.audioPeak;
         if (snap.mediaIsPlaying && rawPeak < 0.08f) {
             // Subtle breathing pulse when playing at low/muted volume
             rawPeak = 0.28f + 0.18f * std::sin(m_marqueePhase * 0.20f);
         }
-        const float freqs[4] = { 0.19f, 0.31f, 0.25f, 0.37f };
-        const float phases[4] = { 0.0f, 1.4f, 2.7f, 4.1f };
+        const float freqs[6] = { 0.19f, 0.31f, 0.25f, 0.37f, 0.22f, 0.34f };
+        const float phases[6] = { 0.0f, 1.4f, 2.7f, 4.1f, 0.8f, 2.1f };
         float barAlpha = 1.0f - std::exp(-20.0f * dt);
-        for (int b = 0; b < 4; ++b) {
+        for (int b = 0; b < 6; ++b) {
             float wave = 0.55f + 0.45f * std::sin(m_marqueePhase * freqs[b] + phases[b]);
             float targetBar = snap.mediaIsPlaying
                 ? std::clamp(0.14f + rawPeak * wave * 1.15f, 0.14f, 1.0f)
@@ -457,8 +462,8 @@ void NotchWindow::OnTimerTick() {
                 changed = true;
             }
         }
-        // Keep redrawing smoothly for marquee scroll while playing
-        if (snap.mediaIsPlaying) {
+        // Keep redrawing smoothly for marquee scroll whenever marquee is actively scrolling
+        if (shouldScrollMarquee) {
             changed = true;
         }
     }
@@ -470,7 +475,7 @@ void NotchWindow::OnTimerTick() {
     float easeExpand = Smoothstep01(m_animProgress);
     float easeMedia  = Smoothstep01(m_mediaAnim);
 
-    float medCollapsedW = (160.0f + 16.0f * easeLayout) * easeMedia;
+    float medCollapsedW = (180.0f + 18.0f * easeLayout) * easeMedia;
     float collapsedW = wDual + (wSingle - wDual) * easeLayout + medCollapsedW;
     float collapsedH = hDual + (hSingle - hDual) * easeLayout;
 
@@ -565,14 +570,14 @@ void NotchWindow::DrawAudioVisualizer(ID2D1RenderTarget* rt, float x, float cy, 
     rt->CreateSolidColorBrush(col, &br);
     if (!br) return;
 
-    const int nBars = 4;
-    float barW = 2.4f;
+    const int nBars = 6;
+    float barW = 1.8f;
     float gap = (w - nBars * barW) / (float)(nBars - 1);
     for (int i = 0; i < nBars; ++i) {
         float bh = std::clamp(m_audioBars[i], 0.14f, 1.0f) * maxH;
         float bx = x + i * (barW + gap);
         D2D1_RECT_F rcBar = D2D1::RectF(bx, cy - bh * 0.5f, bx + barW, cy + bh * 0.5f);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(rcBar, 1.2f, 1.2f), br);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(rcBar, 0.9f, 0.9f), br);
     }
     br->Release();
 }
@@ -701,7 +706,7 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
 
     float padX = 20.0f;
     float innerH = h - 4.0f;
-    float medAllocatedW = (160.0f + 16.0f * layoutT) * easeMedia;
+    float medAllocatedW = (180.0f + 18.0f * layoutT) * easeMedia;
 
     // Determine horizontal sub-regions for Hardware Block and Media Block
     float totalInnerW = std::max(40.0f, w - padX * 2.0f);
@@ -712,7 +717,7 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
     // ==================== 1. Draw Collapsed Media Block (Source Art + Marquee + Audio Peak) ====================
     if (easeMedia > 0.02f && !snap.mediaTitle.empty()) {
         float medAlpha = alpha * easeMedia;
-        float medBoxW = 132.0f + 8.0f * layoutT;
+        float medBoxW = 132.0f + 10.0f * layoutT;
         float medX_Left  = padX;
         float medX_Right = w - padX - medBoxW;
         float medX = medX_Left + (medX_Right - medX_Left) * easeDock;
@@ -751,11 +756,11 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
             rt->CreateSolidColorBrush(D2D1::ColorF(0.62f, 0.68f, 0.78f, medAlpha * (1.0f - layoutT)), &brMedSub);
 
             float textLeft = medX + artSize + 6.0f;
-            float waveW = 14.0f;
+            float waveW = 18.0f;
 
             // Dual-Row: Top line = full-width Marquee, Bottom line = Source Name + Audio Peak Bars
             // Single-Row: Single line = Marquee on left + Audio Peak Bars on right
-            float marqueeRight = (medX + medBoxW) - (waveW + 4.0f) * layoutT;
+            float marqueeRight = (medX + medBoxW) - (waveW + 6.0f) * layoutT;
             float marqueeTop = 1.0f;
             float marqueeBot = 1.0f + innerH * (0.54f + 0.46f * layoutT);
 
@@ -769,7 +774,7 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
 
             // In Dual-Row mode, draw source label on bottom-left of media block
             if (layoutT < 0.85f && brMedSub) {
-                D2D1_RECT_F rcSrc = D2D1::RectF(textLeft, 1.0f + innerH * 0.50f, medX + medBoxW - waveW - 2.0f, 1.0f + innerH);
+                D2D1_RECT_F rcSrc = D2D1::RectF(textLeft, 1.0f + innerH * 0.50f, medX + medBoxW - waveW - 4.0f, 1.0f + innerH);
                 rt->DrawText(snap.mediaSourceName.c_str(), (UINT32)snap.mediaSourceName.size(), fmtMedSub, rcSrc, brMedSub);
             }
 
@@ -1122,7 +1127,7 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
         DrawRoundedAlbumArt(rt, rcArt, 6.0f, medAlpha);
 
         // Source / Player Switcher Pill on top-right of Media Card
-        m_btnMediaSwitchRect = D2D1::RectF(mx + 56.0f, my + 6.0f, mx + medCardW - 26.0f, my + 20.0f);
+        m_btnMediaSwitchRect = D2D1::RectF(mx + 56.0f, my + 6.0f, mx + medCardW - 28.0f, my + 20.0f);
         bool hovSw = (m_hoverButtonId == 10);
         ID2D1SolidColorBrush* brWave = nullptr;
         ID2D1SolidColorBrush* brTitle = nullptr;
@@ -1139,8 +1144,8 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
             rt->DrawText(srcLabel.c_str(), (UINT32)srcLabel.size(), fmtTime, m_btnMediaSwitchRect, brWave);
         }
 
-        // Audio Peak Visualizer on top-right corner of Media Card
-        DrawAudioVisualizer(rt, mx + medCardW - 22.0f, my + 13.0f, 14.0f, 10.0f, ColorRefToD2D(m_config->mediaWaveColor, medAlpha));
+        // Audio Peak Visualizer on top-right corner of Media Card (6 bars, 18px width)
+        DrawAudioVisualizer(rt, mx + medCardW - 26.0f, my + 13.0f, 18.0f, 10.0f, ColorRefToD2D(m_config->mediaWaveColor, medAlpha));
 
         // Track Title Marquee
         D2D1_RECT_F rcTrack = D2D1::RectF(mx + 56.0f, my + 20.0f, mx + medCardW - 8.0f, my + 36.0f);
@@ -1396,7 +1401,7 @@ void NotchWindow::RenderAndPresent() {
     GetDualAndSingleLogicalSize(m_config, wDual, hDual, wSingle, hSingle);
 
     // Pre-allocate a stable canvas large enough for Dual-Row, Single-Row, and Expanded + Media states
-    float maxLogW = std::max({ wDual + 184.0f, wSingle + 184.0f, (float)m_config->expandedWidth + 208.0f, m_currW }) + 24.0f;
+    float maxLogW = std::max({ wDual + 216.0f, wSingle + 216.0f, (float)m_config->expandedWidth + 216.0f, m_currW }) + 24.0f;
     float maxLogH = std::max({ hDual, hSingle, (float)m_config->expandedHeight, m_currH }) + 8.0f;
 
     int canvasW = (((int)std::ceil(maxLogW * scale) + 3) / 4) * 4;

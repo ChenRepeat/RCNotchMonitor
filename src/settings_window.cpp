@@ -667,16 +667,16 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
                 rt->DrawText(dockDesc, (UINT32)wcslen(dockDesc), fmtSub,
                              D2D1::RectF(rc.left + 10.0f, rc.top + 34.0f, rc.right - 8.0f, rc.top + 56.0f), brMuted);
 
-                // Draw miniature audio peak bars preview
+                // Draw miniature audio peak bars preview (6 bars)
                 if (brV) {
-                    const float barH[4] = { 8.0f, 15.0f, 11.0f, 14.0f };
-                    for (int b = 0; b < 4; ++b) {
-                        float bx = rc.left + 12.0f + b * 6.0f;
+                    const float barH[6] = { 6.0f, 13.0f, 9.0f, 15.0f, 11.0f, 14.0f };
+                    for (int b = 0; b < 6; ++b) {
+                        float bx = rc.left + 10.0f + b * 4.6f;
                         float by = rc.bottom - 10.0f;
-                        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx, by - barH[b], bx + 3.5f, by), 1.5f, 1.5f), brV);
+                        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx, by - barH[b], bx + 2.8f, by), 1.2f, 1.2f), brV);
                     }
                     rt->DrawText(L"Spotify / YouTube", 17, fmtBlockVal,
-                                 D2D1::RectF(rc.left + 40.0f, rc.bottom - 26.0f, rc.right - 6.0f, rc.bottom - 6.0f), brV);
+                                 D2D1::RectF(rc.left + 42.0f, rc.bottom - 26.0f, rc.right - 6.0f, rc.bottom - 6.0f), brV);
                 }
             } else {
                 // Compact Single-Row Media Block on Canvas
@@ -687,7 +687,7 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
                                  D2D1::RectF(rc.left + 25.0f, rc.top + 4.0f, rc.right - 18.0f, rc.top + 28.0f), brT);
                 }
                 if (brV) {
-                    std::wstring subStr = (m_config->mediaDockSide == 0) ? L"ılıl 靠左" : L"ılıl 靠右";
+                    std::wstring subStr = (m_config->mediaDockSide == 0) ? L"ılılıl 靠左" : L"ılılıl 靠右";
                     rt->DrawText(subStr.c_str(), (UINT32)subStr.size(), fmtBlockVal,
                                  D2D1::RectF(rc.left + 10.0f, rc.top + 28.0f, rc.right - 6.0f, rc.bottom - 4.0f), brV);
                 }

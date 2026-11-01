@@ -824,10 +824,14 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
                m_config->autoStartAdmin,
                FA_ICON_BOLT);
 
-    // ==================== Bottom Action Bar (4px Grid, 2x Top Margin, Fit Content) ====================
+    // ==================== Bottom Action Bar (4px Grid, Centered Equal Size) ====================
     float botY = 530.0f; // 24px margin below Card 3 (458..506)
-    drawButton(ZONE_BTN_RESET, L"還原",       350.0f, botY, 90.0f,  34.0f, false, FA_ICON_RESET);
-    drawButton(ZONE_BTN_SAVE,  L"儲存並關閉", 452.0f, botY, 132.0f, 34.0f, true,  FA_ICON_SAVE);
+    float actionBtnW = 144.0f;
+    float actionGap = 16.0f;
+    float totalActionW = actionBtnW * 2.0f + actionGap;
+    float actionStartX = (logW - totalActionW) * 0.5f; // 148.0f
+    drawButton(ZONE_BTN_RESET, L"還原",       actionStartX,                          botY, actionBtnW, 34.0f, false, FA_ICON_RESET);
+    drawButton(ZONE_BTN_SAVE,  L"儲存並關閉", actionStartX + actionBtnW + actionGap, botY, actionBtnW, 34.0f, true,  FA_ICON_SAVE);
 
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     rt->EndDraw();

@@ -219,6 +219,8 @@ static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
         L"textinputhost.exe", L"ctfmon.exe", L"gamebar.exe", L"gamebarft.exe",
         L"xboxgamebar.exe", L"gamebarpresencewriter.exe",
         L"gameoverlayui.exe",
+        L"snippingtool.exe", L"screenclippinghost.exe",
+        L"antigravity.exe",
         L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
         L"code.exe", L"devenv.exe", L"notepad.exe", L"notepad++.exe", L"sublime_text.exe",
         L"powershell.exe", L"cmd.exe", L"wt.exe", L"conhost.exe",
@@ -269,8 +271,11 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     // 1:  D3D9 Present_Start
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
     if (id == 42 || id == 55 || id == 1) {
-        uint64_t qpc = 0;
-        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&qpc));
+        // Industry-Standard: use the ETW event's hardware QPC timestamp when the event was emitted!
+        uint64_t qpc = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
+        if (qpc == 0) {
+            QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&qpc));
+        }
 
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
         if (head > 0) {
@@ -289,7 +294,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         }
 
         static int s_loggedEvents = 0;
-        if (s_loggedEvents < 20) {
+        if (s_loggedEvents < 60) {
             s_loggedEvents++;
             FpsLog("[ETW Event #%d] pid=%lu, id=%u, qpc=%llu\n", s_loggedEvents, pid, id, qpc);
         }
@@ -880,19 +885,22 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     DWORD activeGame = g_activeGamePid.load(std::memory_order_relaxed);
     int calculatedFps = 0;
     bool gameActive = false;
+    uint32_t activeCount = 0;
+    uint32_t activeHead = 0;
 
     if (activeGame != 0 && g_qpcFreq > 0) {
         uint64_t nowQpc = 0;
         QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
+        activeHead = head;
 
         if (head > 0) {
             uint64_t latestTs = g_etwFrameTimestamps[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
 
-            // If the latest present event was within the last 1.2 seconds, the game is actively presenting
-            if (nowQpc >= latestTs && (nowQpc - latestTs) <= (g_qpcFreq * 12 / 10)) {
-                // High-resolution sliding window of the last 600ms of presents
-                uint64_t windowLimit = (g_qpcFreq * 6) / 10; // 600 ms window
+            // If the latest present event was within the last 2.5 seconds (supports ETW buffer batch delivery)
+            if (nowQpc >= latestTs && (nowQpc - latestTs) <= (g_qpcFreq * 25 / 10)) {
+                // High-resolution sliding window of the last 1000ms of presents
+                uint64_t windowLimit = g_qpcFreq; // 1000 ms window
                 uint32_t count = 0;
                 uint64_t oldestTs = latestTs;
 
@@ -906,12 +914,13 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                     oldestTs = ts;
                     count++;
                 }
+                activeCount = count;
 
                 if (count >= 2 && latestTs > oldestTs) {
                     double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(g_qpcFreq);
                     if (dtSec > 0.02) {
                         double rawFps = static_cast<double>(count - 1) / dtSec;
-                        if (rawFps >= 10.0 && rawFps <= 1500.0) {
+                        if (rawFps >= 5.0 && rawFps <= 2000.0) {
                             int rounded = static_cast<int>(std::round(rawFps));
                             if (m_stableFps > 0 && std::abs(rawFps - static_cast<double>(m_stableFps)) <= 1.25) {
                                 calculatedFps = m_stableFps;
@@ -934,9 +943,9 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         if (m_zeroFpsStreak >= 2) {
             m_stableFps = 0;
         }
-        // If foreground is desktop or excluded app and 0 presents for > 2 seconds, release active game
+        // If foreground is desktop or excluded app and 0 presents for > 3 seconds, release active game
         DWORD curExcluded = g_excludedPid.load(std::memory_order_relaxed);
-        if (curExcluded != 0 && m_zeroFpsStreak >= 4) {
+        if (curExcluded != 0 && m_zeroFpsStreak >= 6) {
             if (g_activeGamePid.load(std::memory_order_relaxed) != 0) {
                 FpsLog("[Telemetry] Releasing game PID %lu due to idle/desktop focus\n", g_activeGamePid.load());
                 g_activeGamePid.store(0, std::memory_order_relaxed);
@@ -948,8 +957,8 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     uint64_t tickNow = GetTickCount64();
     if (tickNow - s_lastTickLog >= 2000) {
         s_lastTickLog = tickNow;
-        FpsLog("[Telemetry Tick] fgPid=%lu (%ls), activeGame=%lu, fps=%d, isGameActive=%d, zeroStreak=%d\n",
-               fgPid, fgExeName, g_activeGamePid.load(), m_stableFps, gameActive ? 1 : 0, m_zeroFpsStreak);
+        FpsLog("[Telemetry Tick] fgPid=%lu (%ls), activeGame=%lu, head=%u, count=%u, fps=%d, isGameActive=%d, zeroStreak=%d\n",
+               fgPid, fgExeName, g_activeGamePid.load(), activeHead, activeCount, m_stableFps, gameActive ? 1 : 0, m_zeroFpsStreak);
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -990,6 +999,10 @@ void TelemetryEngine::StartEtwFpsThread() {
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         props->Wnode.ClientContext = 1;
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        props->FlushTimer = 1; // Flush real-time buffers every 1 second
+        props->BufferSize = 64; // 64 KB buffers
+        props->MinimumBuffers = 4;
+        props->MaximumBuffers = 32;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
 

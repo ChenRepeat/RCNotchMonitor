@@ -917,25 +917,30 @@ void TelemetryEngine::StartEtwFpsThread() {
     g_etwStopRequested.store(false);
 
     g_etwThread = std::thread([]() {
-        const wchar_t* sessionName = L"WinNotchFpsTraceSession";
-        size_t propSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(sessionName) + 1) * sizeof(wchar_t);
+        wchar_t sessionName[64];
+        swprintf_s(sessionName, L"RCNotchFps_%lu", GetCurrentProcessId());
+
+        ULONG propSize = sizeof(EVENT_TRACE_PROPERTIES) + 2 * MAX_PATH * sizeof(wchar_t);
         std::vector<uint8_t> propBuf(propSize, 0);
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
-        props->Wnode.BufferSize = (ULONG)propSize;
+        props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 1;
+        props->Wnode.ClientContext = 1; // QPC clock resolution
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_PATH * sizeof(wchar_t);
 
-        // Stop any stale session first
+        // Stop any stale session with this PID first
         ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
 
+        // Reset properties before starting
         memset(propBuf.data(), 0, propSize);
-        props->Wnode.BufferSize = (ULONG)propSize;
+        props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         props->Wnode.ClientContext = 1;
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_PATH * sizeof(wchar_t);
 
         ULONG status = StartTraceW(&g_hTraceSession, sessionName, props);
         if (status == ERROR_ALREADY_EXISTS) {
@@ -952,7 +957,7 @@ void TelemetryEngine::StartEtwFpsThread() {
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
 
         EVENT_TRACE_LOGFILEW logFile = {};
-        logFile.LoggerName = const_cast<LPWSTR>(sessionName);
+        logFile.LoggerName = sessionName;
         logFile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
         logFile.EventRecordCallback = EtwEventRecordCallback;
 
@@ -972,12 +977,14 @@ void TelemetryEngine::StopEtwFpsThread() {
         g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
     }
     if (g_hTraceSession != 0) {
-        const wchar_t* sessionName = L"WinNotchFpsTraceSession";
-        size_t propSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(sessionName) + 1) * sizeof(wchar_t);
+        wchar_t sessionName[64];
+        swprintf_s(sessionName, L"RCNotchFps_%lu", GetCurrentProcessId());
+        ULONG propSize = sizeof(EVENT_TRACE_PROPERTIES) + 2 * MAX_PATH * sizeof(wchar_t);
         std::vector<uint8_t> propBuf(propSize, 0);
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
-        props->Wnode.BufferSize = (ULONG)propSize;
+        props->Wnode.BufferSize = propSize;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_PATH * sizeof(wchar_t);
         ControlTraceW(g_hTraceSession, sessionName, props, EVENT_TRACE_CONTROL_STOP);
         g_hTraceSession = 0;
     }

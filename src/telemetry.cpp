@@ -11,6 +11,8 @@
 #include <evntcons.h>
 #include <dxgi1_4.h>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <cwctype>
 #include <algorithm>
@@ -163,6 +165,27 @@ static uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
+static void FpsLog(const char* fmt, ...) {
+    static FILE* s_fp = nullptr;
+    static bool s_opened = false;
+    if (!s_opened) {
+        s_opened = true;
+        wchar_t exePath[MAX_PATH] = {0};
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        wchar_t* p = wcsrchr(exePath, L'\\');
+        if (p) *(p + 1) = L'\0';
+        std::wstring logPath = std::wstring(exePath) + L"fps_debug.log";
+        s_fp = _wfopen(logPath.c_str(), L"w");
+    }
+    if (s_fp) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(s_fp, fmt, args);
+        va_end(args);
+        fflush(s_fp);
+    }
+}
+
 // Global pointer for ETW callback
 static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 
@@ -179,6 +202,7 @@ static uint64_t g_qpcFreq = 0;
 
 static std::atomic<DWORD> g_foregroundPid{0};
 static std::atomic<DWORD> g_excludedPid{0};
+static std::atomic<DWORD> g_activeGamePid{0};
 static std::atomic<bool> g_isFgGameCandidate{false};
 static TRACEHANDLE g_hTraceSession = 0;
 static TRACEHANDLE g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
@@ -194,6 +218,7 @@ static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
         L"services.exe", L"lsass.exe", L"svchost.exe", L"winlogon.exe",
         L"textinputhost.exe", L"ctfmon.exe", L"gamebar.exe", L"gamebarft.exe",
         L"xboxgamebar.exe", L"gamebarpresencewriter.exe",
+        L"gameoverlayui.exe",
         L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
         L"code.exe", L"devenv.exe", L"notepad.exe", L"notepad++.exe", L"sublime_text.exe",
         L"powershell.exe", L"cmd.exe", L"wt.exe", L"conhost.exe",
@@ -228,11 +253,15 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     DWORD pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == GetCurrentProcessId()) return;
 
-    DWORD fgPid = g_foregroundPid.load(std::memory_order_relaxed);
-    if (fgPid == 0 || pid != fgPid) return;
-
-    DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
-    if (excluded != 0 && pid == excluded) return;
+    DWORD targetPid = g_activeGamePid.load(std::memory_order_relaxed);
+    if (targetPid != 0) {
+        if (pid != targetPid) return;
+    } else {
+        DWORD fgPid = g_foregroundPid.load(std::memory_order_relaxed);
+        if (fgPid == 0 || pid != fgPid) return;
+        DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
+        if (excluded != 0 && pid == excluded) return;
+    }
 
     // Supported Presentation Start Events:
     // 42: DXGI Present_Start
@@ -246,9 +275,9 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
         if (head > 0) {
             uint64_t prevQpc = g_etwFrameTimestamps[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
-            // Deduplication: if within 0.8ms of previous present (supports up to 1250 FPS),
+            // Deduplication: if within 0.5ms of previous present (supports up to 2000 FPS),
             // this is a duplicate event (e.g. MPO 55 alongside Present 42) for the same frame!
-            if (g_qpcFreq > 0 && prevQpc > 0 && (qpc >= prevQpc) && (qpc - prevQpc) < (g_qpcFreq / 1250)) {
+            if (g_qpcFreq > 0 && prevQpc > 0 && (qpc >= prevQpc) && (qpc - prevQpc) < (g_qpcFreq / 2000)) {
                 return;
             }
         }
@@ -257,6 +286,12 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         g_etwFrameHead.store(head + 1, std::memory_order_release);
         if (g_pEtwFrameCounter) {
             g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
+        }
+
+        static int s_loggedEvents = 0;
+        if (s_loggedEvents < 20) {
+            s_loggedEvents++;
+            FpsLog("[ETW Event #%d] pid=%lu, id=%u, qpc=%llu\n", s_loggedEvents, pid, id, qpc);
         }
     }
 }
@@ -815,38 +850,38 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     }
 
     DWORD currentSelfPid = GetCurrentProcessId();
+    wchar_t fgExeName[MAX_PATH] = {0};
 
     // If active window is NOT our own notch overlay or settings window, update foreground tracking
     if (fgPid != 0 && fgPid != currentSelfPid) {
-        DWORD oldFgPid = g_foregroundPid.load(std::memory_order_relaxed);
-        if (fgPid != oldFgPid) {
-            g_foregroundPid.store(fgPid, std::memory_order_relaxed);
-            // Reset frame ring buffer on window switch to prevent cross-app FPS pollution
-            g_etwFrameHead.store(0, std::memory_order_relaxed);
-            m_etwFrameCount.store(0, std::memory_order_relaxed);
-            m_lastTrackedPid = fgPid;
-        }
+        g_foregroundPid.store(fgPid, std::memory_order_relaxed);
 
-        wchar_t exeName[MAX_PATH] = {0};
-        bool hasExe = GetProcessExeName(fgPid, exeName, MAX_PATH);
-        bool isExcluded = hasExe && IsExcludedDesktopProcess(exeName);
+        bool hasExe = GetProcessExeName(fgPid, fgExeName, MAX_PATH);
+        bool isExcluded = hasExe && IsExcludedDesktopProcess(fgExeName);
+
         if (isExcluded || IsDesktopOrShellWindow(hwnd)) {
             g_excludedPid.store(fgPid, std::memory_order_relaxed);
             g_isFgGameCandidate.store(false, std::memory_order_relaxed);
         } else {
             g_excludedPid.store(0, std::memory_order_relaxed);
             g_isFgGameCandidate.store(true, std::memory_order_relaxed);
+            // Focused a non-excluded application window -> lock as our active game!
+            DWORD oldGame = g_activeGamePid.load(std::memory_order_relaxed);
+            if (fgPid != oldGame) {
+                g_activeGamePid.store(fgPid, std::memory_order_relaxed);
+                g_etwFrameHead.store(0, std::memory_order_relaxed);
+                m_etwFrameCount.store(0, std::memory_order_relaxed);
+                m_stableFps = 0;
+                FpsLog("[Telemetry] Active game locked to PID %lu (%ls)\n", fgPid, fgExeName);
+            }
         }
     }
 
-    DWORD activeFg = g_foregroundPid.load(std::memory_order_relaxed);
-    DWORD activeExcluded = g_excludedPid.load(std::memory_order_relaxed);
-    bool isCandidate = (activeFg != 0 && activeFg != activeExcluded && activeFg != currentSelfPid);
-
+    DWORD activeGame = g_activeGamePid.load(std::memory_order_relaxed);
     int calculatedFps = 0;
     bool gameActive = false;
 
-    if (isCandidate && g_qpcFreq > 0) {
+    if (activeGame != 0 && g_qpcFreq > 0) {
         uint64_t nowQpc = 0;
         QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
@@ -899,6 +934,22 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         if (m_zeroFpsStreak >= 2) {
             m_stableFps = 0;
         }
+        // If foreground is desktop or excluded app and 0 presents for > 2 seconds, release active game
+        DWORD curExcluded = g_excludedPid.load(std::memory_order_relaxed);
+        if (curExcluded != 0 && m_zeroFpsStreak >= 4) {
+            if (g_activeGamePid.load(std::memory_order_relaxed) != 0) {
+                FpsLog("[Telemetry] Releasing game PID %lu due to idle/desktop focus\n", g_activeGamePid.load());
+                g_activeGamePid.store(0, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    static uint64_t s_lastTickLog = 0;
+    uint64_t tickNow = GetTickCount64();
+    if (tickNow - s_lastTickLog >= 2000) {
+        s_lastTickLog = tickNow;
+        FpsLog("[Telemetry Tick] fgPid=%lu (%ls), activeGame=%lu, fps=%d, isGameActive=%d, zeroStreak=%d\n",
+               fgPid, fgExeName, g_activeGamePid.load(), m_stableFps, gameActive ? 1 : 0, m_zeroFpsStreak);
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -928,7 +979,7 @@ void TelemetryEngine::StartEtwFpsThread() {
         props->Wnode.ClientContext = 1; // QPC clock resolution
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_PATH * sizeof(wchar_t);
+        props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
 
         // Stop any stale session with this PID first
         ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
@@ -940,21 +991,24 @@ void TelemetryEngine::StartEtwFpsThread() {
         props->Wnode.ClientContext = 1;
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_PATH * sizeof(wchar_t);
+        props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
 
         ULONG status = StartTraceW(&g_hTraceSession, sessionName, props);
         if (status == ERROR_ALREADY_EXISTS) {
             ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
             status = StartTraceW(&g_hTraceSession, sessionName, props);
         }
+        FpsLog("[ETW] StartTraceW status=%lu (session: %ls)\n", status, sessionName);
         if (status != ERROR_SUCCESS) {
+            FpsLog("[ETW] StartTraceW FAILED with error %lu. Elevation required!\n", status);
             return; // Not elevated or ETW restricted
         }
 
-        EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        ULONG en1 = EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                   TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        ULONG en2 = EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                   TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        FpsLog("[ETW] EnableTraceEx2 DXGI=%lu, D3D9=%lu\n", en1, en2);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;
@@ -962,10 +1016,12 @@ void TelemetryEngine::StartEtwFpsThread() {
         logFile.EventRecordCallback = EtwEventRecordCallback;
 
         g_hConsumerTrace = OpenTraceW(&logFile);
+        FpsLog("[ETW] OpenTraceW handle=%p\n", (void*)g_hConsumerTrace);
         if (g_hConsumerTrace != INVALID_PROCESSTRACE_HANDLE) {
             ProcessTrace(&g_hConsumerTrace, 1, NULL, NULL);
             CloseTrace(g_hConsumerTrace);
             g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
+            FpsLog("[ETW] ProcessTrace ended\n");
         }
     });
 }
@@ -984,9 +1040,10 @@ void TelemetryEngine::StopEtwFpsThread() {
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
         props->Wnode.BufferSize = propSize;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->LogFileNameOffset = sizeof(EVENT_TRACE_PROPERTIES) + MAX_PATH * sizeof(wchar_t);
+        props->LogFileNameOffset = 0;
         ControlTraceW(g_hTraceSession, sessionName, props, EVENT_TRACE_CONTROL_STOP);
         g_hTraceSession = 0;
+        FpsLog("[ETW] Session stopped\n");
     }
     if (g_etwThread.joinable()) {
         g_etwThread.join();

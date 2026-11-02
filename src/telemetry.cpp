@@ -329,6 +329,7 @@ static bool TryReadRtssFps(int& outFps, bool& outGameActive) {
 
 // High-Resolution ETW Frame Ring Buffer (512 slots)
 constexpr size_t ETW_FRAME_BUF_SIZE = 512;
+constexpr uint64_t ETW_TIME_FREQ = 10000000ULL; // Windows 100ns FILETIME units = 10 MHz
 static uint64_t g_etwFrameTimestamps[ETW_FRAME_BUF_SIZE] = {};
 static std::atomic<uint32_t> g_etwFrameHead{0};
 static uint64_t g_qpcFreq = 0;
@@ -354,6 +355,7 @@ static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
         L"gameoverlayui.exe",
         L"snippingtool.exe", L"screenclippinghost.exe",
         L"antigravity.exe",
+        L"msiafterburner.exe", L"rtss.exe", L"rtsshooks64.exe", L"rivatuner.exe",
         L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
         L"code.exe", L"devenv.exe", L"notepad.exe", L"notepad++.exe", L"sublime_text.exe",
         L"powershell.exe", L"cmd.exe", L"wt.exe", L"conhost.exe",
@@ -393,9 +395,16 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         if (pid != targetPid) return;
     } else {
         DWORD fgPid = g_foregroundPid.load(std::memory_order_relaxed);
-        if (fgPid == 0 || pid != fgPid) return;
-        DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
-        if (excluded != 0 && pid == excluded) return;
+        if (fgPid != 0 && pid == fgPid) {
+            DWORD excluded = g_excludedPid.load(std::memory_order_relaxed);
+            if (excluded == 0 || pid != excluded) {
+                g_activeGamePid.store(pid, std::memory_order_relaxed);
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
     }
 
     // Supported Presentation Start Events:
@@ -404,23 +413,25 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     // 1:  D3D9 Present_Start
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
     if (id == 42 || id == 55 || id == 1) {
-        // Industry-Standard: use the ETW event's hardware QPC timestamp when the event was emitted!
-        uint64_t qpc = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
-        if (qpc == 0) {
-            QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&qpc));
+        // Industry-Standard: ETW events use 100ns FILETIME units (10,000,000 / sec)
+        uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
+        if (ts == 0) {
+            FILETIME ft = {};
+            GetSystemTimeAsFileTime(&ft);
+            ts = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
         }
 
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
         if (head > 0) {
-            uint64_t prevQpc = g_etwFrameTimestamps[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
-            // Deduplication: if within 0.5ms of previous present (supports up to 2000 FPS),
+            uint64_t prevTs = g_etwFrameTimestamps[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
+            // Deduplication: if within 0.5ms (supports up to 2000 FPS),
             // this is a duplicate event (e.g. MPO 55 alongside Present 42) for the same frame!
-            if (g_qpcFreq > 0 && prevQpc > 0 && (qpc >= prevQpc) && (qpc - prevQpc) < (g_qpcFreq / 2000)) {
+            if (prevTs > 0 && (ts >= prevTs) && (ts - prevTs) < (ETW_TIME_FREQ / 2000)) {
                 return;
             }
         }
 
-        g_etwFrameTimestamps[head & (ETW_FRAME_BUF_SIZE - 1)] = qpc;
+        g_etwFrameTimestamps[head & (ETW_FRAME_BUF_SIZE - 1)] = ts;
         g_etwFrameHead.store(head + 1, std::memory_order_release);
         if (g_pEtwFrameCounter) {
             g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
@@ -429,7 +440,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         static int s_loggedEvents = 0;
         if (s_loggedEvents < 60) {
             s_loggedEvents++;
-            FpsLog("[ETW Event #%d] pid=%lu, id=%u, qpc=%llu\n", s_loggedEvents, pid, id, qpc);
+            FpsLog("[ETW Event #%d] pid=%lu, id=%u, ft=%llu\n", s_loggedEvents, pid, id, ts);
         }
     }
 }
@@ -1038,20 +1049,23 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         if (activeGame == 0 && fgPid != 0 && fgPid != currentSelfPid && !isExcluded) {
             g_activeGamePid.store(fgPid, std::memory_order_relaxed);
         }
-    } else if (activeGame != 0 && g_qpcFreq > 0) {
-        // 3. Fallback: Native high-performance ETW DXGI/D3D9 trace engine
-        uint64_t nowQpc = 0;
-        QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
+    } else if (activeGame != 0) {
+        // 3. Fallback: Native high-performance ETW DXGI/D3D9 trace engine (Intel PresentMon method)
+        FILETIME nowFt = {};
+        GetSystemTimeAsFileTime(&nowFt);
+        uint64_t nowTs = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
         activeHead = head;
 
         if (head > 0) {
             uint64_t latestTs = g_etwFrameTimestamps[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
 
-            // If the latest present event was within the last 2.5 seconds (supports ETW buffer batch delivery)
-            if (nowQpc >= latestTs && (nowQpc - latestTs) <= (g_qpcFreq * 25 / 10)) {
+            // If the latest present event was within the last 2.5 seconds (ETW_TIME_FREQ * 2.5 = 25,000,000 units)
+            uint64_t age = (nowTs >= latestTs) ? (nowTs - latestTs) : (latestTs - nowTs);
+            if (latestTs > 0 && age <= (ETW_TIME_FREQ * 25 / 10)) {
                 // High-resolution sliding window of the last 1000ms of presents
-                uint64_t windowLimit = g_qpcFreq; // 1000 ms window
+                uint64_t windowLimit = ETW_TIME_FREQ; // 1000 ms window
                 uint32_t count = 0;
                 uint64_t oldestTs = latestTs;
 
@@ -1068,10 +1082,10 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 activeCount = count;
 
                 if (count >= 2 && latestTs > oldestTs) {
-                    double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(g_qpcFreq);
+                    double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(ETW_TIME_FREQ);
                     if (dtSec > 0.02) {
                         double rawFps = static_cast<double>(count - 1) / dtSec;
-                        if (rawFps >= 5.0 && rawFps <= 2000.0) {
+                        if (rawFps >= 1.0 && rawFps <= 3000.0) {
                             int rounded = static_cast<int>(std::round(rawFps));
                             if (m_stableFps > 0 && std::abs(rawFps - static_cast<double>(m_stableFps)) <= 1.25) {
                                 calculatedFps = m_stableFps;

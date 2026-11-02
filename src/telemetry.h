@@ -146,9 +146,9 @@ private:
     HANDLE m_hJobObject = NULL;
     HANDLE m_hBridgeProcess = NULL;
 
-    // ETW FPS & High-Resolution QPC State
+    // ETW FPS & High-Resolution Rolling Window state
     std::atomic<uint32_t> m_etwFrameCount{0};
-    uint64_t m_lastFpsQpc = 0;
+    DWORD m_lastTrackedPid = 0;
     int m_stableFps = 0;
     int m_zeroFpsStreak = 0;
 

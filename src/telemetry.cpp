@@ -172,6 +172,8 @@ static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9 } };
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
+// Microsoft-Windows-DxgKrnl: {802EC45A-1E99-4B83-9920-87C98277BA9D} (OpenGL / Vulkan / WDDM Presentation)
+static const GUID DXGKRNL_PROVIDER_GUID = { 0x802EC45A, 0x1E99, 0x4B83, { 0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D } };
 
 // -----------------------------------------------------------------------------
 // MSI Afterburner & RivaTuner Statistics Server (RTSS) Shared Memory Structures
@@ -355,12 +357,22 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     DWORD pid = pEvent->EventHeader.ProcessId;
     if (pid == 0 || pid == GetCurrentProcessId() || pid == GetDwmPid()) return;
 
-    // Supported Presentation Start Events:
-    // 42: DXGI Present_Start
-    // 55: DXGI PresentMultiplaneOverlay_Start (Windows 10/11 MPO / Independent Flip)
-    // 1:  D3D9 Present_Start
+    // Supported Presentation Events across all graphics APIs:
+    // DXGI: 42 (Present_Start), 55 (PresentMultiplaneOverlay_Start / Independent Flip)
+    // D3D9: 1  (Present_Start)
+    // DxgKrnl (OpenGL / Vulkan / WDDM kernel presentation): 184 (Present_Start), 171 (SubmitPresentHistory)
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
-    if (id == 42 || id == 55 || id == 1) {
+    bool isPresent = false;
+
+    if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGI_PROVIDER_GUID)) {
+        if (id == 42 || id == 55) isPresent = true;
+    } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, D3D9_PROVIDER_GUID)) {
+        if (id == 1) isPresent = true;
+    } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGKRNL_PROVIDER_GUID)) {
+        if (id == 184 || id == 171) isPresent = true;
+    }
+
+    if (isPresent) {
         // Industry-Standard: ETW events use 100ns FILETIME units (10,000,000 / sec)
         uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
         if (ts == 0) {
@@ -373,7 +385,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         if (head > 0) {
             const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
             // Deduplication: if within 0.5ms (supports up to 2000 FPS) for the same process,
-            // this is an MPO / Present duplicate event for the exact same frame!
+            // this is an MPO / DxgKrnl / DXGI duplicate event for the exact same frame!
             if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
                 (ts - prev.timestamp) < (ETW_TIME_FREQ / 2000)) {
                 return;
@@ -929,6 +941,104 @@ static bool IsDesktopOrShellWindow(HWND hwnd) {
     return false;
 }
 
+// Resolves actual rendering process ID for UWP/Modern apps wrapped in ApplicationFrameHost
+static DWORD ResolveForegroundTargetPid(HWND hwnd, DWORD fgPid) {
+    if (!hwnd || fgPid == 0) return fgPid;
+
+    wchar_t exeName[MAX_PATH] = {0};
+    if (GetProcessExeName(fgPid, exeName, MAX_PATH)) {
+        if (_wcsicmp(exeName, L"ApplicationFrameHost.exe") == 0) {
+            // 1. Check direct child window with class "Windows.UI.Core.CoreWindow"
+            HWND hCore = FindWindowExW(hwnd, NULL, L"Windows.UI.Core.CoreWindow", NULL);
+            if (hCore) {
+                DWORD childPid = 0;
+                GetWindowThreadProcessId(hCore, &childPid);
+                if (childPid != 0 && childPid != fgPid) {
+                    return childPid;
+                }
+            }
+
+            // 2. Enumerate child windows to find the real UWP process
+            struct ChildSearch {
+                DWORD hostPid;
+                DWORD foundPid;
+            } cs = { fgPid, 0 };
+
+            EnumChildWindows(hwnd, [](HWND child, LPARAM lParam) -> BOOL {
+                auto* p = reinterpret_cast<ChildSearch*>(lParam);
+                DWORD pid = 0;
+                GetWindowThreadProcessId(child, &pid);
+                if (pid != 0 && pid != p->hostPid) {
+                    p->foundPid = pid;
+                    return FALSE; // Found! Stop enumerating.
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&cs));
+
+            if (cs.foundPid != 0) {
+                return cs.foundPid;
+            }
+
+            // 3. Top-level CoreWindow owned by or titled like this frame
+            wchar_t hostTitle[256] = {0};
+            GetWindowTextW(hwnd, hostTitle, 256);
+
+            struct TopSearch {
+                HWND hostHwnd;
+                DWORD hostPid;
+                const wchar_t* title;
+                DWORD foundPid;
+            } ts = { hwnd, fgPid, hostTitle, 0 };
+
+            EnumWindows([](HWND top, LPARAM lParam) -> BOOL {
+                auto* p = reinterpret_cast<TopSearch*>(lParam);
+                if (top == p->hostHwnd) return TRUE;
+                wchar_t cls[128] = {0};
+                if (GetClassNameW(top, cls, 128) > 0 && _wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
+                    HWND owner = GetWindow(top, GW_OWNER);
+                    wchar_t title[256] = {0};
+                    GetWindowTextW(top, title, 256);
+                    if (owner == p->hostHwnd || (p->title[0] != L'\0' && _wcsicmp(title, p->title) == 0)) {
+                        DWORD pid = 0;
+                        GetWindowThreadProcessId(top, &pid);
+                        if (pid != 0 && pid != p->hostPid) {
+                            p->foundPid = pid;
+                            return FALSE;
+                        }
+                    }
+                }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&ts));
+
+            if (ts.foundPid != 0) {
+                return ts.foundPid;
+            }
+
+            // 4. Fallback for UWP: find active 3D process in ETW ring buffer
+            uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
+            uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
+            DWORD dwmPid = GetDwmPid();
+            DWORD selfPid = GetCurrentProcessId();
+
+            FILETIME nowFt = {};
+            GetSystemTimeAsFileTime(&nowFt);
+            uint64_t nowTs = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+
+            for (uint32_t i = 0; i < maxScan; ++i) {
+                uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
+                const auto& frame = g_etwFrameBuf[idx];
+                if (frame.pid != 0 && frame.pid != fgPid && frame.pid != dwmPid && frame.pid != selfPid) {
+                    uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
+                    if (age < (ETW_TIME_FREQ * 2)) { // within 2 seconds
+                        return frame.pid;
+                    }
+                }
+            }
+        }
+    }
+    return fgPid;
+}
+
 void TelemetryEngine::UpdateFpsAndDisplay() {
     DEVMODEW dm = {};
     dm.dmSize = sizeof(dm);
@@ -945,6 +1055,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
 
     DWORD selfPid = GetCurrentProcessId();
     DWORD dwmPid = GetDwmPid();
+    DWORD resolvedFgPid = ResolveForegroundTargetPid(hwnd, fgPid);
 
     FILETIME nowFt = {};
     GetSystemTimeAsFileTime(&nowFt);
@@ -962,15 +1073,15 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         calculatedFps = extFps;
         gameActive = extActive;
     } else {
-        // 2. ETW Dynamic 3D Present Detection (Intel PresentMon method, NO blacklist)
+        // 2. ETW Dynamic 3D Present Detection (Intel PresentMon method, multi-API: DXGI/D3D9/DxgKrnl/UWP)
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
         activeHead = head;
 
         // Candidate PID selection:
         // If foreground window is not our own overlay and not DWM, check if foreground is a 3D app
         DWORD candidatePid = 0;
-        if (fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
-            candidatePid = fgPid;
+        if (resolvedFgPid != 0 && resolvedFgPid != selfPid && resolvedFgPid != dwmPid) {
+            candidatePid = resolvedFgPid;
         } else if (m_targetGamePid != 0) {
             // When user clicks our notch overlay or settings, retain currently tracked game
             candidatePid = m_targetGamePid;
@@ -1097,6 +1208,12 @@ void TelemetryEngine::StartEtwFpsThread() {
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
         EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        ULONG sDxg = EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                   TRACE_LEVEL_INFORMATION, 0x10000, 0, 0, NULL);
+        if (sDxg != ERROR_SUCCESS) {
+            EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                           TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        }
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;

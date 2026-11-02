@@ -71,11 +71,13 @@ flowchart TD
 
 - **第一軌：直讀 MSI Afterburner 與 RTSS 共享記憶體**
   - 當系統已運行 MSI Afterburner 或 RivaTuner Statistics Server（RTSS）時，直讀 `MAHMSharedMemory` 與 `RTSSSharedMemory_RTSS_Timer`，數值與其 OSD 保持同步且無額外延遲。
-- **第二軌：獨立原生 Windows ETW (PresentMon) 核心追蹤**
-  - 使用者**無須安裝任何第三方輔助軟體**。透過 Windows 核心事件追蹤機制（`Microsoft-Windows-DXGI` 與 `D3D9`），直接掛鉤系統繪圖調度。
-  - 採 **100 奈秒（10 MHz）硬體時間戳（`FILETIME`）** 與 **1024 槽位無鎖環狀佇列**，計算 1000ms 滑動視窗幀率。
+- **第二軌：獨立原生 Windows ETW 核心追蹤**
+  - 使用者**無須安裝任何第三方輔助軟體**。透過 Windows 核心事件追蹤機制（`Microsoft-Windows-DXGI`、`D3D9`、`Microsoft-Windows-DxgKrnl` 與 UWP `ApplicationFrameHost` 階層解析），全面支援 DirectX 9/11/12、OpenGL（如 Minecraft Java 版）與 Vulkan / UWP 商店遊戲（如 Minecraft 基岩版）。
+  - 採 **100 奈秒（10 MHz）硬體時間戳（`FILETIME`）** 與 **1024 槽位無鎖環狀佇列**，計算 1000ms 滑動視窗幀率，並內建微秒級事件去重機制（0.5ms 去重）。
 - **動態 3D 活動判定（無黑名單限制）**
   - 不使用易受干擾的靜態黑名單。改以「該視窗近 1 秒內是否有 3D Present 畫面輸出」動態識別 3D 遊戲；靜態應用（如瀏覽器、記事本、文書工具）自動呈現桌面待機狀態。
+- **UWP / 視窗託管自動解析**
+  - 針對微軟商店與 Xbox 應用（以 `ApplicationFrameHost.exe` 為前景殼層的遊戲），自動深度遍歷視窗樹並結合 ETW 環狀緩衝區，精準定位底層實際渲染進程。
 - **焦點展開保持機制**
   - 點擊展開動態島時，焦點落在靈動島本體（`selfPid`）依然鎖定背景遊戲繼續輸出 FPS，不會輕易中斷當前遊戲幀率輸出。
 
@@ -87,7 +89,7 @@ flowchart TD
 | **CPU 處理器** | 使用率 `%` + 溫度 `°C` | 型號、即時時脈 `GHz`、封裝功耗 `W` | `GetSystemTimes`、`CallNtPowerInformation`、LibreHardwareMonitor 橋接 |
 | **GPU 顯示卡** | 使用率 `%` + 溫度 `°C` | 型號、VRAM 已用/總量 `GB`、功耗 `W` | NVIDIA NVML (`nvml.dll`) + AMD ADL + DXGI 1.4 記憶體預算 |
 | **RAM 記憶體** | 記憶體使用率 `%` | 已用容量 / 總實體記憶體容量 `GB` | `GlobalMemoryStatusEx` |
-| **FPS 幀率** | 即時 FPS (4 位數槽位) | 即時 3D 幀率、螢幕更新率 `Hz`、桌面待機狀態 | 雙軌架構：MSI Afterburner/RTSS 共享記憶體 + 原生 Windows ETW DXGI Present |
+| **FPS 幀率** | 即時 FPS (4 位數槽位) | 即時 3D 幀率、螢幕更新率 `Hz`、桌面待機狀態 | 雙軌架構：MSI Afterburner/RTSS 共享記憶體 + 原生 Windows ETW（DXGI / D3D9 / DxgKrnl / UWP） |
 | **媒體控制** | 專輯封面微縮膠囊 | 專輯封面、曲名、演唱者、進度條、播放控制 | Windows GSMTC (`Windows.Media.Control`) + WASAPI CoreAudio |
 
 ### 3. Windows 媒體控制與音量視覺化 (GSMTC + WASAPI)

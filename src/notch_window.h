@@ -77,6 +77,7 @@ private:
     // Animation & Interaction state
     bool m_isHovered = false;
     bool m_trackingMouse = false;
+    int m_unhoverStreak = 0;
     // Hover IDs: 0=none, 1=Settings, 3=Lock, 10=MediaSwitch, 11=Prev, 12=Rew(-10s), 13=PlayPause, 14=Ffwd(+10s), 15=Next, 16=SeekBar
     int m_hoverButtonId = 0;
     float m_animProgress = 0.0f;  // 0.0 = collapsed, 1.0 = expanded

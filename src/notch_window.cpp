@@ -289,6 +289,24 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
         }
 
+        float scale = m_config->GetEffectiveScale();
+        float canvasLogW = (m_canvasW > 0) ? ((float)m_canvasW / scale) : (m_currW + 16.0f);
+        float drawW = m_currW + 16.0f;
+        float offsetX = (canvasLogW - drawW) * 0.5f;
+
+        float mx = (float)GET_X_LPARAM(lParam) / scale - offsetX;
+        float my = (float)GET_Y_LPARAM(lParam) / scale;
+
+        // Strict hit-test: Is the cursor actually within the visible notch boundary?
+        float expH = (float)m_config->expandedHeight;
+        float activeH = m_isHovered ? std::max(m_currH, expH) : m_currH;
+        bool insideNotch = (mx >= -4.0f && mx <= drawW + 4.0f && my >= -4.0f && my <= activeH + 6.0f);
+
+        if (!insideNotch) {
+            // Cursor is in transparent canvas area outside the notch; do not trigger hover
+            return 0;
+        }
+
         if (!m_trackingMouse) {
             TRACKMOUSEEVENT tme = {};
             tme.cbSize = sizeof(tme);
@@ -301,14 +319,8 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             QueryPerformanceCounter(&m_lastTick);
             m_isHovered = true;
         }
+        m_unhoverStreak = 0;
 
-        float scale = m_config->GetEffectiveScale();
-        float canvasLogW = (m_canvasW > 0) ? ((float)m_canvasW / scale) : (m_currW + 16.0f);
-        float drawW = m_currW + 16.0f;
-        float offsetX = (canvasLogW - drawW) * 0.5f;
-
-        float mx = (float)GET_X_LPARAM(lParam) / scale - offsetX;
-        float my = (float)GET_Y_LPARAM(lParam) / scale;
         int oldBtn = m_hoverButtonId;
         m_hoverButtonId = 0;
         if (m_animProgress > 0.65f) {
@@ -342,14 +354,41 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
-    case WM_MOUSELEAVE:
+    case WM_MOUSELEAVE: {
         m_trackingMouse = false;
         if (m_isHovered && !m_isDragging) {
-            QueryPerformanceCounter(&m_lastTick);
-            m_isHovered = false;
+            POINT pt;
+            if (GetCursorPos(&pt)) {
+                RECT rcWin = {};
+                GetWindowRect(m_hwnd, &rcWin);
+                float scale = m_config->GetEffectiveScale();
+                float expH = (float)m_config->expandedHeight;
+                float drawW = m_currW + 16.0f;
+                float activePhysW = drawW * scale;
+                float activePhysH = std::max(m_currH, expH) * scale;
+                float winCenterX = (rcWin.left + rcWin.right) * 0.5f;
+                float left = winCenterX - activePhysW * 0.5f - 6.0f;
+                float right = winCenterX + activePhysW * 0.5f + 6.0f;
+                float top = (float)rcWin.top - 4.0f;
+                float bottom = (float)rcWin.top + activePhysH + 6.0f;
+                if (pt.x < (LONG)left || pt.x > (LONG)right || pt.y < (LONG)top || pt.y > (LONG)bottom) {
+                    QueryPerformanceCounter(&m_lastTick);
+                    m_isHovered = false;
+                    m_hoverButtonId = 0;
+                    m_unhoverStreak = 0;
+                } else {
+                    // Cursor is still physically inside active area, re-arm tracking
+                    TRACKMOUSEEVENT tme = {};
+                    tme.cbSize = sizeof(tme);
+                    tme.dwFlags = TME_LEAVE;
+                    tme.hwndTrack = m_hwnd;
+                    TrackMouseEvent(&tme);
+                    m_trackingMouse = true;
+                }
+            }
         }
-        m_hoverButtonId = 0;
         return 0;
+    }
 
     case WM_LBUTTONDOWN: {
         float scale = m_config->GetEffectiveScale();
@@ -441,24 +480,43 @@ void NotchWindow::OnTimerTick() {
     m_lastTick = now;
     dt = std::clamp(dt, 0.001f, 0.050f);
 
+    float wDualRef = 260.0f, hDualRef = 36.0f, wSingleRef = 396.0f, hSingleRef = 28.0f;
+    GetDualAndSingleLogicalSize(m_config, wDualRef, hDualRef, wSingleRef, hSingleRef);
+    float easeLayoutRef = Smoothstep01(m_layoutAnim);
+    float easeMediaRef  = Smoothstep01(m_mediaAnim);
+    float medCollapsedWRef = (204.0f + 20.0f * easeLayoutRef) * easeMediaRef;
+    float colWRef = wDualRef + (wSingleRef - wDualRef) * easeLayoutRef + medCollapsedWRef;
+    float expWRef = (easeMediaRef > 0.02f || m_config->layoutMode == 1) ? colWRef : (float)m_config->expandedWidth;
+    float expHRef = (float)m_config->expandedHeight;
+
     if (m_isHovered && !m_config->clickThroughLocked && !m_isDragging) {
         POINT pt;
         if (GetCursorPos(&pt)) {
             RECT rcWin = {};
             GetWindowRect(m_hwnd, &rcWin);
             float scale = m_config->GetEffectiveScale();
-            float actualPhysW = (m_currW + 16.0f) * scale;
-            float actualPhysH = m_currH * scale;
+            float activeLogW = std::max({ m_currW, colWRef, expWRef }) + 16.0f;
+            float activeLogH = std::max(m_currH, expHRef);
+            float actualPhysW = activeLogW * scale;
+            float actualPhysH = activeLogH * scale;
             float winCenterX = (rcWin.left + rcWin.right) * 0.5f;
-            float left = winCenterX - actualPhysW * 0.5f - 6.0f;
-            float right = winCenterX + actualPhysW * 0.5f + 6.0f;
+            float left = winCenterX - actualPhysW * 0.5f - 8.0f;
+            float right = winCenterX + actualPhysW * 0.5f + 8.0f;
             float top = (float)rcWin.top - 4.0f;
-            float bottom = (float)rcWin.top + actualPhysH + 6.0f;
+            float bottom = (float)rcWin.top + actualPhysH + 8.0f;
             if (pt.x < (LONG)left || pt.x > (LONG)right || pt.y < (LONG)top || pt.y > (LONG)bottom) {
-                m_isHovered = false;
-                m_hoverButtonId = 0;
+                m_unhoverStreak++;
+                if (m_unhoverStreak >= 4) { // ~60-80ms stable grace period before collapsing
+                    m_isHovered = false;
+                    m_hoverButtonId = 0;
+                    m_unhoverStreak = 0;
+                }
+            } else {
+                m_unhoverStreak = 0;
             }
         }
+    } else {
+        m_unhoverStreak = 0;
     }
 
     TelemetrySnapshot snap;
@@ -536,7 +594,12 @@ void NotchWindow::OnTimerTick() {
     float collapsedW = wDual + (wSingle - wDual) * easeLayout + medCollapsedW;
     float collapsedH = hDual + (hSingle - hDual) * easeLayout;
 
-    float expW = (float)m_config->expandedWidth + 208.0f * easeMedia;
+    // Expanded width matches the original collapsed width (especially with media),
+    // ensuring the left and right boundaries remain stationary and completely preventing
+    // boundary oscillation and open/close flickering ("避免有部分區塊可以一直觸發開關導致跳閃")
+    float expW = (easeMedia > 0.02f || m_config->layoutMode == 1)
+        ? collapsedW
+        : (float)m_config->expandedWidth;
     float expH = (float)m_config->expandedHeight;
 
     float desiredW = collapsedW + (expW - collapsedW) * easeExpand;
@@ -1145,7 +1208,11 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
 
     std::wstring headerStr = shortCpu + L"  •  " + shortGpu;
     D2D1_RECT_F rcHeader = D2D1::RectF(padX + 16.0f, 0.0f, w - padX - 72.0f, 36.0f);
-    if (brMuted) rt->DrawText(headerStr.c_str(), (UINT32)headerStr.size(), fmtHeader, rcHeader, brMuted);
+    if (brMuted) {
+        rt->PushAxisAlignedClip(rcHeader, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        rt->DrawText(headerStr.c_str(), (UINT32)headerStr.size(), fmtHeader, rcHeader, brMuted);
+        rt->PopAxisAlignedClip();
+    }
 
     // Top-right Settings & Click-Through Lock buttons (centered vertically in 36px header bar)
     m_btnSettingsRect = D2D1::RectF(w - padX - 62.0f, 6.0f, w - padX - 34.0f, 30.0f);
@@ -1162,7 +1229,7 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     float medCardW = 200.0f;
     float medAllocW = (medCardW + gap) * easeMedia;
     float totalBodyW = w - padX * 2.0f;
-    float hwBodyW = std::max(240.0f, totalBodyW - medAllocW);
+    float hwBodyW = std::max(216.0f, totalBodyW - medAllocW);
     float hwStartX = padX + medAllocW * (1.0f - easeDock);
 
     // -------------------- 2A. Expanded Media Control Panel (Full-height on Left or Right) --------------------
@@ -1513,7 +1580,7 @@ bool NotchWindow::SavePreviewBmp(const std::wstring& bmpPath, bool expandedState
 
     float baseW = m_config->GetCollapsedLogicalWidth() + (204.0f + 20.0f * easeLayout) * easeMedia;
     float baseH = m_config->GetCollapsedLogicalHeight();
-    float expW  = (float)m_config->expandedWidth + 208.0f * easeMedia;
+    float expW  = (easeMedia > 0.02f || m_config->layoutMode == 1) ? baseW : (float)m_config->expandedWidth;
     float expH  = (float)m_config->expandedHeight;
 
     int logW = (((int)(expandedState ? expW : baseW) + 16 + 3) / 4) * 4;

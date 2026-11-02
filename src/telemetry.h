@@ -149,6 +149,7 @@ private:
     // ETW FPS & High-Resolution Rolling Window state
     std::atomic<uint32_t> m_etwFrameCount{0};
     DWORD m_lastTrackedPid = 0;
+    DWORD m_targetGamePid = 0;
     int m_stableFps = 0;
     int m_zeroFpsStreak = 0;
 

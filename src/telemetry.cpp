@@ -194,6 +194,139 @@ static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xA
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
 
+// -----------------------------------------------------------------------------
+// MSI Afterburner & RivaTuner Statistics Server (RTSS) Shared Memory Structures
+// -----------------------------------------------------------------------------
+struct MAHM_SHARED_MEMORY_HEADER {
+    DWORD dwSignature;      // 'MAHM' (0x4D41484D)
+    DWORD dwVersion;
+    DWORD dwHeaderSize;
+    DWORD dwNumEntries;
+    DWORD dwEntrySize;
+    __time32_t time;
+    DWORD dwNumGpuEntries;
+    DWORD dwGpuEntrySize;
+};
+
+struct MAHM_SHARED_MEMORY_ENTRY {
+    char szSrcName[MAX_PATH];
+    char szSrcUnits[MAX_PATH];
+    char szLocalizedSrcName[MAX_PATH];
+    char szLocalizedSrcUnits[MAX_PATH];
+    char szRecommendedFormat[MAX_PATH];
+    float data;
+    float minLimit;
+    float maxLimit;
+    DWORD dwFlags;
+    DWORD dwGpu;
+    DWORD dwSrcId;          // 0x00000050 = Framerate
+};
+
+struct RTSS_APP_ENTRY {
+    DWORD dwProcessId;
+    char szName[MAX_PATH];
+    DWORD dwFlags;
+    DWORD dwTime0;
+    DWORD dwTime1;
+    DWORD dwFrames;
+    DWORD dwFrameTime;
+    DWORD dwStatFlags;
+    DWORD dwStatTime0;
+    DWORD dwStatTime1;
+    DWORD dwStatFrames;
+    DWORD dwStatCount;
+    DWORD dwStatFramerateMin;
+    DWORD dwStatFramerateAvg;
+    DWORD dwStatFramerateMax;
+};
+
+struct RTSS_SHARED_MEMORY {
+    DWORD dwSignature; // 'RTSS' (0x53535452)
+    DWORD dwVersion;
+    DWORD dwAppEntrySize;
+    DWORD dwAppArrOffset;
+    DWORD dwAppArrSize;
+    DWORD dwOSDArrOffset;
+    DWORD dwOSDArrSize;
+    DWORD dwOSDFrame;
+};
+
+static bool TryReadMsiAfterburnerFps(int& outFps, bool& outGameActive) {
+    HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, "MAHMSharedMemory");
+    if (!hMap) return false;
+
+    void* pMap = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pMap) {
+        CloseHandle(hMap);
+        return false;
+    }
+
+    bool found = false;
+    auto* hdr = reinterpret_cast<const MAHM_SHARED_MEMORY_HEADER*>(pMap);
+    if (hdr->dwSignature == 0x4D41484D /* 'MAHM' */ && hdr->dwHeaderSize >= sizeof(DWORD) * 5) {
+        for (DWORD i = 0; i < hdr->dwNumEntries; ++i) {
+            auto* entry = reinterpret_cast<const MAHM_SHARED_MEMORY_ENTRY*>(
+                reinterpret_cast<const uint8_t*>(hdr) + hdr->dwHeaderSize + (i * hdr->dwEntrySize)
+            );
+            if (entry->dwSrcId == 0x00000050 /* MONITORING_SOURCE_ID_FRAMERATE */ || _stricmp(entry->szSrcName, "Framerate") == 0) {
+                if (entry->data > 0.5f && entry->data < 3000.0f) {
+                    outFps = static_cast<int>(std::round(entry->data));
+                    outGameActive = true;
+                    found = true;
+                }
+                break;
+            }
+        }
+    }
+
+    UnmapViewOfFile(pMap);
+    CloseHandle(hMap);
+    return found;
+}
+
+static bool TryReadRtssFps(int& outFps, bool& outGameActive) {
+    const char* mapNames[] = { "RTSSSharedMemory_RTSS_Timer", "RTSSSharedMemory" };
+    for (const char* mapName : mapNames) {
+        HANDLE hMap = OpenFileMappingA(FILE_MAP_READ, FALSE, mapName);
+        if (!hMap) continue;
+
+        void* pMap = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!pMap) {
+            CloseHandle(hMap);
+            continue;
+        }
+
+        bool found = false;
+        auto* hdr = reinterpret_cast<const RTSS_SHARED_MEMORY*>(pMap);
+        if (hdr->dwSignature == 0x53535452 /* 'RTSS' */ && hdr->dwAppArrOffset > 0 && hdr->dwAppEntrySize > 0) {
+            for (DWORD i = 0; i < hdr->dwAppArrSize; ++i) {
+                auto* app = reinterpret_cast<const RTSS_APP_ENTRY*>(
+                    reinterpret_cast<const uint8_t*>(hdr) + hdr->dwAppArrOffset + (i * hdr->dwAppEntrySize)
+                );
+                if (app->dwProcessId != 0) {
+                    float curFps = 0.0f;
+                    if (app->dwTime1 > app->dwTime0 && app->dwFrames > 0) {
+                        curFps = static_cast<float>(app->dwFrames) * 1000.0f / static_cast<float>(app->dwTime1 - app->dwTime0);
+                    } else if (app->dwFrameTime > 0) {
+                        curFps = 1000000.0f / static_cast<float>(app->dwFrameTime);
+                    }
+                    if (curFps >= 1.0f && curFps <= 3000.0f) {
+                        outFps = static_cast<int>(std::round(curFps));
+                        outGameActive = true;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        UnmapViewOfFile(pMap);
+        CloseHandle(hMap);
+        if (found) return true;
+    }
+    return false;
+}
+
 // High-Resolution ETW Frame Ring Buffer (512 slots)
 constexpr size_t ETW_FRAME_BUF_SIZE = 512;
 static uint64_t g_etwFrameTimestamps[ETW_FRAME_BUF_SIZE] = {};
@@ -856,13 +989,14 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
 
     DWORD currentSelfPid = GetCurrentProcessId();
     wchar_t fgExeName[MAX_PATH] = {0};
+    bool isExcluded = false;
 
     // If active window is NOT our own notch overlay or settings window, update foreground tracking
     if (fgPid != 0 && fgPid != currentSelfPid) {
         g_foregroundPid.store(fgPid, std::memory_order_relaxed);
 
         bool hasExe = GetProcessExeName(fgPid, fgExeName, MAX_PATH);
-        bool isExcluded = hasExe && IsExcludedDesktopProcess(fgExeName);
+        isExcluded = hasExe && IsExcludedDesktopProcess(fgExeName);
 
         if (isExcluded || IsDesktopOrShellWindow(hwnd)) {
             g_excludedPid.store(fgPid, std::memory_order_relaxed);
@@ -888,7 +1022,24 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     uint32_t activeCount = 0;
     uint32_t activeHead = 0;
 
-    if (activeGame != 0 && g_qpcFreq > 0) {
+    // 1. Primary: If MSI Afterburner is running, read its shared memory for 100% identical stats!
+    int extFps = 0;
+    bool extActive = false;
+    if (TryReadMsiAfterburnerFps(extFps, extActive)) {
+        calculatedFps = extFps;
+        gameActive = extActive;
+        if (activeGame == 0 && fgPid != 0 && fgPid != currentSelfPid && !isExcluded) {
+            g_activeGamePid.store(fgPid, std::memory_order_relaxed);
+        }
+    } else if (TryReadRtssFps(extFps, extActive)) {
+        // 2. Secondary: If RivaTuner Statistics Server (RTSS) is running, read its shared memory!
+        calculatedFps = extFps;
+        gameActive = extActive;
+        if (activeGame == 0 && fgPid != 0 && fgPid != currentSelfPid && !isExcluded) {
+            g_activeGamePid.store(fgPid, std::memory_order_relaxed);
+        }
+    } else if (activeGame != 0 && g_qpcFreq > 0) {
+        // 3. Fallback: Native high-performance ETW DXGI/D3D9 trace engine
         uint64_t nowQpc = 0;
         QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&nowQpc));
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
@@ -940,12 +1091,13 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         m_zeroFpsStreak = 0;
     } else {
         m_zeroFpsStreak++;
-        if (m_zeroFpsStreak >= 2) {
+        // Maintain last known FPS for up to ~1.5s to bridge batch delivery gaps and loading hitches
+        if (m_zeroFpsStreak >= 6) {
             m_stableFps = 0;
         }
-        // If foreground is desktop or excluded app and 0 presents for > 3 seconds, release active game
+        // If foreground is desktop or excluded app and 0 presents for > 2.5s, release active game
         DWORD curExcluded = g_excludedPid.load(std::memory_order_relaxed);
-        if (curExcluded != 0 && m_zeroFpsStreak >= 6) {
+        if (curExcluded != 0 && m_zeroFpsStreak >= 10) {
             if (g_activeGamePid.load(std::memory_order_relaxed) != 0) {
                 FpsLog("[Telemetry] Releasing game PID %lu due to idle/desktop focus\n", g_activeGamePid.load());
                 g_activeGamePid.store(0, std::memory_order_relaxed);

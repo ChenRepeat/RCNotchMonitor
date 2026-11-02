@@ -165,27 +165,6 @@ static uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
-static void FpsLog(const char* fmt, ...) {
-    static FILE* s_fp = nullptr;
-    static bool s_opened = false;
-    if (!s_opened) {
-        s_opened = true;
-        wchar_t exePath[MAX_PATH] = {0};
-        GetModuleFileNameW(NULL, exePath, MAX_PATH);
-        wchar_t* p = wcsrchr(exePath, L'\\');
-        if (p) *(p + 1) = L'\0';
-        std::wstring logPath = std::wstring(exePath) + L"fps_debug.log";
-        s_fp = _wfopen(logPath.c_str(), L"w");
-    }
-    if (s_fp) {
-        va_list args;
-        va_start(args, fmt);
-        vfprintf(s_fp, fmt, args);
-        va_end(args);
-        fflush(s_fp);
-    }
-}
-
 // Global pointer for ETW callback
 static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 
@@ -407,12 +386,6 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         g_etwFrameHead.store(head + 1, std::memory_order_release);
         if (g_pEtwFrameCounter) {
             g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
-        }
-
-        static int s_loggedEvents = 0;
-        if (s_loggedEvents < 60) {
-            s_loggedEvents++;
-            FpsLog("[ETW Event #%d] pid=%lu, id=%u, ft=%llu\n", s_loggedEvents, pid, id, ts);
         }
     }
 }
@@ -1066,16 +1039,6 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         }
     }
 
-    static uint64_t s_lastTickLog = 0;
-    uint64_t tickNow = GetTickCount64();
-    if (tickNow - s_lastTickLog >= 2000) {
-        s_lastTickLog = tickNow;
-        wchar_t fgExeName[MAX_PATH] = {0};
-        GetProcessExeName(fgPid, fgExeName, MAX_PATH);
-        FpsLog("[Telemetry Tick] fgPid=%lu (%ls), targetGame=%lu, head=%u, count=%u, fps=%d, isGameActive=%d, zeroStreak=%d\n",
-               fgPid, fgExeName, m_targetGamePid, activeHead, activeCount, m_stableFps, gameActive ? 1 : 0, m_zeroFpsStreak);
-    }
-
     std::lock_guard<std::mutex> lock(m_mutex);
     m_snapshot.monitorRefreshHz = hz;
     if (m_stableFps > 0) {
@@ -1126,17 +1089,14 @@ void TelemetryEngine::StartEtwFpsThread() {
             ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
             status = StartTraceW(&g_hTraceSession, sessionName, props);
         }
-        FpsLog("[ETW] StartTraceW status=%lu (session: %ls)\n", status, sessionName);
         if (status != ERROR_SUCCESS) {
-            FpsLog("[ETW] StartTraceW FAILED with error %lu. Elevation required!\n", status);
             return; // Not elevated or ETW restricted
         }
 
-        ULONG en1 = EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                   TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        ULONG en2 = EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                   TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        FpsLog("[ETW] EnableTraceEx2 DXGI=%lu, D3D9=%lu\n", en1, en2);
+        EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;
@@ -1144,12 +1104,10 @@ void TelemetryEngine::StartEtwFpsThread() {
         logFile.EventRecordCallback = EtwEventRecordCallback;
 
         g_hConsumerTrace = OpenTraceW(&logFile);
-        FpsLog("[ETW] OpenTraceW handle=%p\n", (void*)g_hConsumerTrace);
         if (g_hConsumerTrace != INVALID_PROCESSTRACE_HANDLE) {
             ProcessTrace(&g_hConsumerTrace, 1, NULL, NULL);
             CloseTrace(g_hConsumerTrace);
             g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
-            FpsLog("[ETW] ProcessTrace ended\n");
         }
     });
 }
@@ -1171,7 +1129,6 @@ void TelemetryEngine::StopEtwFpsThread() {
         props->LogFileNameOffset = 0;
         ControlTraceW(g_hTraceSession, sessionName, props, EVENT_TRACE_CONTROL_STOP);
         g_hTraceSession = 0;
-        FpsLog("[ETW] Session stopped\n");
     }
     if (g_etwThread.joinable()) {
         g_etwThread.join();

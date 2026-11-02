@@ -354,7 +354,7 @@ static bool IsExcludedDesktopProcess(const wchar_t* exeName) {
         L"xboxgamebar.exe", L"gamebarpresencewriter.exe",
         L"gameoverlayui.exe",
         L"snippingtool.exe", L"screenclippinghost.exe",
-        L"antigravity.exe",
+        L"antigravity.exe", L"chatgpt.exe",
         L"msiafterburner.exe", L"rtss.exe", L"rtsshooks64.exe", L"rivatuner.exe",
         L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
         L"code.exe", L"devenv.exe", L"notepad.exe", L"notepad++.exe", L"sublime_text.exe",

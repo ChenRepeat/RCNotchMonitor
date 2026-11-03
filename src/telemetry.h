@@ -133,6 +133,9 @@ private:
     uint64_t m_prevKernelTime = 0;
     uint64_t m_prevUserTime = 0;
     float m_smoothedCpuTemp = 46.0f;
+    bool m_isAmdCpu = false;
+    bool m_isIntelCpu = false;
+    bool m_isAmdX3D = false;
 
     // NVML dynamic bindings
     HMODULE m_hNvml = NULL;

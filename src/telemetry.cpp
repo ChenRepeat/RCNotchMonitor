@@ -428,6 +428,7 @@ static bool TryReadRtssFps(int& outFps, bool& outGameActive) {
 struct EtwFrameRecord {
     uint64_t timestamp;
     DWORD pid;
+    bool isDwm;
 };
 
 constexpr size_t ETW_FRAME_BUF_SIZE = 1024;
@@ -551,15 +552,28 @@ static TRACEHANDLE g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
 static std::thread g_etwThread;
 static std::atomic<bool> g_etwStopRequested{false};
 
+static std::atomic<DWORD> g_dwmPid{0};
+
 static DWORD GetDwmPid() {
-    static DWORD s_dwmPid = 0;
-    if (s_dwmPid == 0) {
-        HWND hDwm = FindWindowW(L"Dwm", NULL);
-        if (hDwm) {
-            GetWindowThreadProcessId(hDwm, &s_dwmPid);
+    DWORD cur = g_dwmPid.load(std::memory_order_relaxed);
+    if (cur != 0) return cur;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"dwm.exe") == 0) {
+                    g_dwmPid.store(pe.th32ProcessID, std::memory_order_relaxed);
+                    cur = pe.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(hSnap, &pe));
         }
+        CloseHandle(hSnap);
     }
-    return s_dwmPid;
+    return cur;
 }
 
 static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
@@ -585,6 +599,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
     uint32_t prov1 = pEvent->EventHeader.ProviderId.Data1;
     bool isPresent = false;
+    bool isDwmEvent = false;
 
     // Supported Presentation Events:
     // DXGI: 42 (Present_Start), 55 (PresentMultiplaneOverlay_Start)
@@ -595,7 +610,11 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     } else if (prov1 == 0x783ACA0A /* D3D9 */) {
         if (id == 1) isPresent = true;
     } else if (prov1 == 0x9E9BBA3C /* DWM */) {
-        if (id == 57) isPresent = true;
+        if (id == 57) {
+            isPresent = true;
+            isDwmEvent = true;
+            g_dwmPid.store(pid, std::memory_order_relaxed);
+        }
     }
 
     if (isPresent) {
@@ -619,6 +638,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         uint32_t slot = head & (ETW_FRAME_BUF_SIZE - 1);
         g_etwFrameBuf[slot].timestamp = ts;
         g_etwFrameBuf[slot].pid = pid;
+        g_etwFrameBuf[slot].isDwm = isDwmEvent;
         g_etwFrameHead.store(head + 1, std::memory_order_release);
         if (g_pEtwFrameCounter) {
             g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
@@ -1387,7 +1407,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                         oldestTs = frame.timestamp;
                         count = 1;
                     } else {
-                        if ((latestTs - frame.timestamp) > windowLimit) break;
+                        if (frame.timestamp < latestTs && (latestTs - frame.timestamp) > windowLimit) break;
                         oldestTs = frame.timestamp;
                         count++;
                     }
@@ -1403,7 +1423,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 for (uint32_t i = 0; i < maxScan; ++i) {
                     uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                     const auto& frame = g_etwFrameBuf[idx];
-                    if (frame.pid == dwmPid) {
+                    if (frame.isDwm || (dwmPid != 0 && frame.pid == dwmPid)) {
                         uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
                         if (latestTs == 0) {
                             if (age > (timeFreq * 25 / 10)) break;
@@ -1411,7 +1431,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                             oldestTs = frame.timestamp;
                             count = 1;
                         } else {
-                            if ((latestTs - frame.timestamp) > windowLimit) break;
+                            if (frame.timestamp < latestTs && (latestTs - frame.timestamp) > windowLimit) break;
                             oldestTs = frame.timestamp;
                             count++;
                         }

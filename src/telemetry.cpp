@@ -176,6 +176,16 @@ static std::wstring TrimWide(const std::wstring& s) {
     return s.substr(start, end - start + 1);
 }
 
+static uint64_t GetQpcFreq() {
+    static uint64_t s_freq = 0;
+    if (s_freq == 0) {
+        LARGE_INTEGER f = {};
+        QueryPerformanceFrequency(&f);
+        s_freq = static_cast<uint64_t>(f.QuadPart);
+    }
+    return (s_freq > 0) ? s_freq : 10000000ULL;
+}
+
 static uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
@@ -201,6 +211,8 @@ static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9 } };
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
+// Microsoft-Windows-Dwm-Core: {9E9BBA3C-2E38-40CB-99F4-9E8281425164} (Hardware / Composition Presentation)
+static const GUID DWM_PROVIDER_GUID = { 0x9E9BBA3C, 0x2E38, 0x40CB, { 0x99, 0xF4, 0x9E, 0x82, 0x81, 0x42, 0x51, 0x64 } };
 
 // -----------------------------------------------------------------------------
 // MSI Afterburner & RivaTuner Statistics Server (RTSS) Shared Memory Structures
@@ -568,29 +580,38 @@ static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (!pEvent) return;
     DWORD pid = pEvent->EventHeader.ProcessId;
-    if (pid == 0 || pid == GetCurrentProcessId() || pid == GetDwmPid()) return;
+    if (pid == 0 || pid == GetCurrentProcessId()) return;
 
-    // Supported Presentation Start Events:
-    // 42: DXGI Present_Start
-    // 55: DXGI PresentMultiplaneOverlay_Start (Windows 10/11 MPO / Independent Flip)
-    // 1:  D3D9 Present_Start
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
-    if (id == 42 || id == 55 || id == 1) {
-        // Industry-Standard: ETW events use 100ns FILETIME units (10,000,000 / sec)
+    uint32_t prov1 = pEvent->EventHeader.ProviderId.Data1;
+    bool isPresent = false;
+
+    // Supported Presentation Events:
+    // DXGI: 42 (Present_Start), 55 (PresentMultiplaneOverlay_Start)
+    // D3D9: 1 (Present_Start)
+    // DWM:  57 (Dwm_VSync_Frame / Frame Presented to screen)
+    if (prov1 == 0xCA11C036 /* DXGI */) {
+        if (id == 42 || id == 55) isPresent = true;
+    } else if (prov1 == 0x783ACA0A /* D3D9 */) {
+        if (id == 1) isPresent = true;
+    } else if (prov1 == 0x9E9BBA3C /* DWM */) {
+        if (id == 57) isPresent = true;
+    }
+
+    if (isPresent) {
         uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
         if (ts == 0) {
-            FILETIME ft = {};
-            GetSystemTimeAsFileTime(&ft);
-            ts = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            LARGE_INTEGER qpcNow = {};
+            QueryPerformanceCounter(&qpcNow);
+            ts = static_cast<uint64_t>(qpcNow.QuadPart);
         }
 
+        uint64_t minInterval = (GetQpcFreq() > 0) ? (GetQpcFreq() / 2000) : 5000ULL; // 0.5ms (supports up to 2000 FPS)
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
         if (head > 0) {
             const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
-            // Deduplication: if within 0.5ms (supports up to 2000 FPS) for the same process,
-            // this is an MPO / Present duplicate event for the exact same frame!
             if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
-                (ts - prev.timestamp) < (ETW_TIME_FREQ / 2000)) {
+                (ts - prev.timestamp) < minInterval) {
                 return;
             }
         }
@@ -1309,9 +1330,10 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     DWORD selfPid = GetCurrentProcessId();
     DWORD dwmPid = GetDwmPid();
 
-    FILETIME nowFt = {};
-    GetSystemTimeAsFileTime(&nowFt);
-    uint64_t nowTs = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+    LARGE_INTEGER qpcNow = {};
+    QueryPerformanceCounter(&qpcNow);
+    uint64_t nowTs = static_cast<uint64_t>(qpcNow.QuadPart);
+    uint64_t timeFreq = (GetQpcFreq() > 0) ? GetQpcFreq() : 10000000ULL;
 
     int calculatedFps = 0;
     bool gameActive = false;
@@ -1323,16 +1345,26 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         calculatedFps = extFps;
         gameActive = extActive;
     } else {
-        // 2. ETW Dynamic 3D Present Detection (Intel PresentMon method, NO blacklist)
+        // 2. High-Performance Universal Presentation Engine (DirectX 9/11/12, Vulkan, OpenGL, DWM)
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
 
-        // Candidate PID selection:
-        // If foreground window is not our own overlay and not DWM, check if foreground is a 3D app
+        bool fgIsShell = (hwnd == NULL) || IsDesktopOrShellWindow(hwnd);
+        if (!fgIsShell && fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
+            wchar_t exeName[MAX_PATH] = {0};
+            if (GetProcessExeName(fgPid, exeName, MAX_PATH)) {
+                if (_wcsicmp(exeName, L"explorer.exe") == 0 ||
+                    _wcsicmp(exeName, L"SearchHost.exe") == 0 ||
+                    _wcsicmp(exeName, L"StartMenuExperienceHost.exe") == 0) {
+                    fgIsShell = true;
+                }
+            }
+        }
+
         DWORD candidatePid = 0;
-        if (fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
+        if (!fgIsShell && fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
             candidatePid = fgPid;
+            m_targetGamePid = fgPid;
         } else if (m_targetGamePid != 0) {
-            // When user clicks our notch overlay or settings, retain currently tracked game
             candidatePid = m_targetGamePid;
         }
 
@@ -1340,34 +1372,55 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             uint64_t latestTs = 0;
             uint32_t count = 0;
             uint64_t oldestTs = 0;
-            uint64_t windowLimit = ETW_TIME_FREQ; // 1000 ms sliding window
-
+            uint64_t windowLimit = timeFreq; // exactly 1000 ms sliding window in QPC ticks
             uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
+
+            // Pass A: Direct game presents from candidatePid (DXGI / D3D9)
             for (uint32_t i = 0; i < maxScan; ++i) {
                 uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                 const auto& frame = g_etwFrameBuf[idx];
                 if (frame.pid == candidatePid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
                     if (latestTs == 0) {
-                        // If latest present for this process is older than 2.5s, it is not actively rendering 3D
-                        if (age > (ETW_TIME_FREQ * 25 / 10)) {
-                            break;
-                        }
+                        if (age > (timeFreq * 25 / 10)) break; // older than 2.5s
                         latestTs = frame.timestamp;
                         oldestTs = frame.timestamp;
                         count = 1;
                     } else {
-                        if ((latestTs - frame.timestamp) > windowLimit) {
-                            break; // 1000ms window reached
-                        }
+                        if ((latestTs - frame.timestamp) > windowLimit) break;
                         oldestTs = frame.timestamp;
                         count++;
                     }
                 }
             }
 
+            // Pass B: For Anti-cheat protected games (Monster Hunter Wilds, LoL Vanguard) or OpenGL/Vulkan,
+            // user-mode DXGI is isolated, so we correlate with DWM hardware composition presents (dwmPid)
+            if (count < 2) {
+                latestTs = 0;
+                count = 0;
+                oldestTs = 0;
+                for (uint32_t i = 0; i < maxScan; ++i) {
+                    uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
+                    const auto& frame = g_etwFrameBuf[idx];
+                    if (frame.pid == dwmPid) {
+                        uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
+                        if (latestTs == 0) {
+                            if (age > (timeFreq * 25 / 10)) break;
+                            latestTs = frame.timestamp;
+                            oldestTs = frame.timestamp;
+                            count = 1;
+                        } else {
+                            if ((latestTs - frame.timestamp) > windowLimit) break;
+                            oldestTs = frame.timestamp;
+                            count++;
+                        }
+                    }
+                }
+            }
+
             if (count >= 2 && latestTs > oldestTs) {
-                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(ETW_TIME_FREQ);
+                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(timeFreq);
                 if (dtSec > 0.02) {
                     double rawFps = static_cast<double>(count - 1) / dtSec;
                     if (rawFps >= 1.0 && rawFps <= 3000.0) {
@@ -1378,7 +1431,6 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                             calculatedFps = rounded;
                         }
                         gameActive = true;
-                        m_targetGamePid = candidatePid; // Confirmed active 3D game!
                     }
                 }
             }
@@ -1394,7 +1446,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             m_stableFps = 0;
         }
         if (m_zeroFpsStreak >= 12) {
-            m_targetGamePid = 0; // Release target game after 3+ seconds of non-3D activity
+            m_targetGamePid = 0;
         }
     }
 
@@ -1422,26 +1474,24 @@ void TelemetryEngine::StartEtwFpsThread() {
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 1; // QPC clock resolution
+        props->Wnode.ClientContext = 1; // High-precision QPC clock
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
+        props->LogFileNameOffset = 0;
 
-        // Stop any stale session with this PID first
         ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
 
-        // Reset properties before starting
         memset(propBuf.data(), 0, propSize);
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         props->Wnode.ClientContext = 1;
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
-        props->FlushTimer = 1; // Flush real-time buffers every 1 second
-        props->BufferSize = 64; // 64 KB buffers
+        props->FlushTimer = 1;
+        props->BufferSize = 64;
         props->MinimumBuffers = 4;
         props->MaximumBuffers = 32;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
+        props->LogFileNameOffset = 0;
 
         ULONG status = StartTraceW(&g_hTraceSession, sessionName, props);
         if (status == ERROR_ALREADY_EXISTS) {
@@ -1449,13 +1499,17 @@ void TelemetryEngine::StartEtwFpsThread() {
             status = StartTraceW(&g_hTraceSession, sessionName, props);
         }
         if (status != ERROR_SUCCESS) {
-            return; // Not elevated or ETW restricted
+            return;
         }
 
+        // DXGI & D3D9 standard providers
         EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
         EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        // DWM FrameRate provider with Keyword 0x8 (DwmFrameRate - emits ONLY per-frame presents, zero noise)
+        EnableTraceEx2(g_hTraceSession, &DWM_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0x8 /* DwmFrameRate */, 0, 0, NULL);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;

@@ -609,8 +609,8 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         // 1 = Present_Start, 4 = PresentEx_Start (D3D9Ex Windowed Flip)
         if (id == 1 || id == 4) isPresent = true;
     } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGKRNL_PROVIDER_GUID)) {
-        // 184 = Present_Start, 171 = SubmitPresentHistory (Windowed Blt/Flip), 178 = SubmitPresentHistory_Start, 169 = Flip_Start, 311 = Token_PresentHistory
-        if (id == 184 || id == 171 || id == 178 || id == 169 || id == 311) isPresent = true;
+        // 184 = Present_Start, 171 = SubmitPresentHistory (Windowed Blt/Flip), 178 = SubmitPresentHistory_Start, 169 = Flip_Start, 170 = Flip, 311 = Token_PresentHistory, 312 = Token_PresentHistory_Start
+        if (id == 184 || id == 171 || id == 178 || id == 169 || id == 170 || id == 311 || id == 312) isPresent = true;
     }
 
     if (isPresent) {
@@ -621,13 +621,14 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         }
 
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
-        if (head > 0) {
-            const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
-            // Deduplication: if within 0.5ms (supports up to 2000 FPS) for the same process,
-            // this is an MPO / DxgKrnl / DXGI duplicate event for the exact same frame!
-            if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
-                (ts - prev.timestamp) < (ETW_TIME_FREQ / 2000)) {
-                return;
+        for (uint32_t d = 1; d <= 4 && d <= head; ++d) {
+            const auto& prev = g_etwFrameBuf[(head - d) & (ETW_FRAME_BUF_SIZE - 1)];
+            if (prev.pid == pid && prev.timestamp > 0) {
+                uint64_t diff = (ts >= prev.timestamp) ? (ts - prev.timestamp) : (prev.timestamp - ts);
+                if (diff < (ETW_TIME_FREQ / 2000)) { // within 0.5ms (supports up to 2000 FPS)
+                    return; // duplicate present event for the same frame
+                }
+                break;
             }
         }
 
@@ -1470,38 +1471,34 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             outCount = 0;
             if (pid == 0 || head == 0) return 0;
 
-            uint64_t latestTs = 0;
+            uint64_t maxTs = 0;
+            uint64_t minTs = UINT64_MAX;
             uint32_t count = 0;
-            uint64_t oldestTs = 0;
-            uint64_t windowLimit = ETW_TIME_FREQ; // 1000 ms sliding window
 
             uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
             for (uint32_t i = 0; i < maxScan; ++i) {
                 uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                 const auto& frame = g_etwFrameBuf[idx];
-                if (frame.pid == pid) {
+                if (frame.pid == pid && frame.timestamp > 0) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (latestTs == 0) {
-                        if (age > (ETW_TIME_FREQ * 25 / 10)) { // 2.5s
-                            break;
-                        }
-                        latestTs = frame.timestamp;
-                        oldestTs = frame.timestamp;
-                        count = 1;
-                    } else {
-                        if ((latestTs - frame.timestamp) > windowLimit) {
-                            break;
-                        }
-                        oldestTs = frame.timestamp;
-                        count++;
+                    if (age > (ETW_TIME_FREQ * 25 / 10)) { // older than 2.5s
+                        if (count > 0) break;
+                        continue;
+                    }
+                    if (frame.timestamp > maxTs) maxTs = frame.timestamp;
+                    if (frame.timestamp < minTs) minTs = frame.timestamp;
+                    count++;
+                    // Once we span at least 1.0 second of frame intervals, we have a complete sample window
+                    if (maxTs > minTs && (maxTs - minTs) >= ETW_TIME_FREQ) {
+                        break;
                     }
                 }
             }
             outCount = count;
 
-            if (count >= 2 && latestTs > oldestTs) {
-                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(ETW_TIME_FREQ);
-                if (dtSec > 0.02) {
+            if (count >= 2 && maxTs > minTs) {
+                double dtSec = static_cast<double>(maxTs - minTs) / static_cast<double>(ETW_TIME_FREQ);
+                if (dtSec >= 0.02) {
                     double rawFps = static_cast<double>(count - 1) / dtSec;
                     if (rawFps >= 1.0 && rawFps <= 3000.0) {
                         return static_cast<int>(std::round(rawFps));
@@ -1589,6 +1586,9 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                             _wcsicmp(exe, L"firefox.exe") == 0 ||
                             _wcsicmp(exe, L"brave.exe") == 0 ||
                             _wcsicmp(exe, L"discord.exe") == 0 ||
+                            _wcsicmp(exe, L"LeagueClientUx.exe") == 0 ||
+                            _wcsicmp(exe, L"LeagueClient.exe") == 0 ||
+                            _wcsicmp(exe, L"RiotClientServices.exe") == 0 ||
                             _wcsicmp(exe, L"Code.exe") == 0) {
                             continue;
                         }
@@ -1716,7 +1716,7 @@ void TelemetryEngine::StartEtwFpsThread() {
         ULONG sD3d9 = EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
         ULONG sDxgk = EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+                       TRACE_LEVEL_INFORMATION, 0x1, 0, 0, NULL);
         FpsLog("[ETW Startup] EnableTrace: DXGI=%lu, D3D9=%lu, DXGKRNL=%lu\n", sDxgi, sD3d9, sDxgk);
 
         EVENT_TRACE_LOGFILEW logFile = {};

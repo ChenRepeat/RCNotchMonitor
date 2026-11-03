@@ -675,11 +675,12 @@ void NotchWindow::DrawRoundedAlbumArt(ID2D1RenderTarget* rt, const D2D1_RECT_F& 
             // Keep aspect ratio without deformation: fill height ("把高撐滿") and center horizontally ("致中")
             float bmpW = std::max(1.0f, (float)m_albumBitmapW);
             float bmpH = std::max(1.0f, (float)m_albumBitmapH);
-            float scale = std::max(w / bmpW, h / bmpH);
+            // Strictly fill height ("把高撐滿") and center horizontally ("致中") without aspect deformation
+            float scale = h / bmpH;
             float drawBmpW = bmpW * scale;
-            float drawBmpH = bmpH * scale;
+            float drawBmpH = h;
             float transX = rc.left + (w - drawBmpW) * 0.5f;
-            float transY = rc.top + (h - drawBmpH) * 0.5f;
+            float transY = rc.top;
 
             bmpBrush->SetTransform(
                 D2D1::Matrix3x2F::Scale(scale, scale) *

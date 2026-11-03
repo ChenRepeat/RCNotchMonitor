@@ -194,29 +194,6 @@ static bool IsCurrentProcessElevated() {
     return elevated;
 }
 
-static void FpsLog(const char* fmt, ...) {
-    static FILE* s_fp = nullptr;
-    static bool s_opened = false;
-    static std::mutex s_logMutex;
-    std::lock_guard<std::mutex> lock(s_logMutex);
-    if (!s_opened) {
-        s_opened = true;
-        wchar_t exePath[MAX_PATH] = {0};
-        GetModuleFileNameW(NULL, exePath, MAX_PATH);
-        wchar_t* p = wcsrchr(exePath, L'\\');
-        if (p) *(p + 1) = L'\0';
-        std::wstring logPath = std::wstring(exePath) + L"fps_debug.log";
-        s_fp = _wfopen(logPath.c_str(), L"w");
-    }
-    if (s_fp) {
-        va_list args;
-        va_start(args, fmt);
-        vfprintf(s_fp, fmt, args);
-        va_end(args);
-        fflush(s_fp);
-    }
-}
-
 // Global pointer for ETW callback
 static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 
@@ -224,10 +201,6 @@ static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9 } };
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
-// Microsoft-Windows-DxgKrnl: {802EC45A-1E99-4B83-9920-87C98277BA9D} (OpenGL / Vulkan / WDDM Presentation)
-static const GUID DXGKRNL_PROVIDER_GUID = { 0x802EC45A, 0x1E99, 0x4B83, { 0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D } };
-// Microsoft-Windows-Dwm-Core: {9E9BBA3C-2E38-40CB-99F4-9E8281425164}
-static const GUID DWM_PROVIDER_GUID = { 0x9E9BBA3C, 0x2E38, 0x40CB, { 0x99, 0xF4, 0x9E, 0x82, 0x81, 0x42, 0x51, 0x64 } };
 
 // -----------------------------------------------------------------------------
 // MSI Afterburner & RivaTuner Statistics Server (RTSS) Shared Memory Structures
@@ -595,49 +568,30 @@ static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (!pEvent) return;
     DWORD pid = pEvent->EventHeader.ProcessId;
-
-    static std::atomic<int> s_rawEvents{0};
-    int r = s_rawEvents.fetch_add(1, std::memory_order_relaxed);
-    if (r < 40) {
-        FpsLog("[ETW Raw Callback #%d] pid=%lu, id=%u, prov=0x%08X\n",
-               r + 1, pid, pEvent->EventHeader.EventDescriptor.Id,
-               pEvent->EventHeader.ProviderId.Data1);
-    }
-
     if (pid == 0 || pid == GetCurrentProcessId() || pid == GetDwmPid()) return;
 
+    // Supported Presentation Start Events:
+    // 42: DXGI Present_Start
+    // 55: DXGI PresentMultiplaneOverlay_Start (Windows 10/11 MPO / Independent Flip)
+    // 1:  D3D9 Present_Start
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
-    uint32_t prov1 = pEvent->EventHeader.ProviderId.Data1;
-    bool isPresent = false;
-
-    // Fast and robust match by Provider GUID Data1 (0xCA11C036=DXGI, 0x783ACA0A=D3D9, 0x802EC45A=DXGKRNL):
-    if (prov1 == 0xCA11C036 || InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGI_PROVIDER_GUID)) {
-        // 42 = Present_Start, 55 = PresentMultiplaneOverlay_Start, 39 = SwapChain_Present_Start, 53 = SwapChain_PresentMPO
-        if (id == 42 || id == 55 || id == 39 || id == 53) isPresent = true;
-    } else if (prov1 == 0x783ACA0A || InlineIsEqualGUID(pEvent->EventHeader.ProviderId, D3D9_PROVIDER_GUID)) {
-        // 1 = Present_Start, 4 = PresentEx_Start
-        if (id == 1 || id == 4) isPresent = true;
-    } else if (prov1 == 0x802EC45A || InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGKRNL_PROVIDER_GUID)) {
-        // 184 = Present_Start, 171 = SubmitPresentHistory, 178 = SubmitPresentHistory_Start, 169 = Flip_Start, 170 = Flip, 311 = Token_PresentHistory, 312 = Token_PresentHistory_Start
-        if (id == 184 || id == 171 || id == 178 || id == 169 || id == 170 || id == 311 || id == 312) isPresent = true;
-    }
-
-    if (isPresent) {
-        // Windows ETW delivers EventHeader.TimeStamp in system time (100ns FILETIME)
+    if (id == 42 || id == 55 || id == 1) {
+        // Industry-Standard: ETW events use 100ns FILETIME units (10,000,000 / sec)
         uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
         if (ts == 0) {
-            ts = GetFileTimeNow();
+            FILETIME ft = {};
+            GetSystemTimeAsFileTime(&ft);
+            ts = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
         }
 
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
-        for (uint32_t d = 1; d <= 4 && d <= head; ++d) {
-            const auto& prev = g_etwFrameBuf[(head - d) & (ETW_FRAME_BUF_SIZE - 1)];
-            if (prev.pid == pid && prev.timestamp > 0) {
-                uint64_t diff = (ts >= prev.timestamp) ? (ts - prev.timestamp) : (prev.timestamp - ts);
-                if (diff < (ETW_TIME_FREQ / 2000)) { // within 0.5ms (supports up to 2000 FPS)
-                    return; // duplicate present event for the same frame
-                }
-                break;
+        if (head > 0) {
+            const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
+            // Deduplication: if within 0.5ms (supports up to 2000 FPS) for the same process,
+            // this is an MPO / Present duplicate event for the exact same frame!
+            if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
+                (ts - prev.timestamp) < (ETW_TIME_FREQ / 2000)) {
+                return;
             }
         }
 
@@ -647,13 +601,6 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         g_etwFrameHead.store(head + 1, std::memory_order_release);
         if (g_pEtwFrameCounter) {
             g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
-        }
-
-        static std::atomic<int> s_loggedEvents{0};
-        int evtNum = s_loggedEvents.fetch_add(1, std::memory_order_relaxed);
-        if (evtNum < 80) {
-            FpsLog("[ETW Event #%d] pid=%lu, id=%u, prov=0x%08X, ts=%llu\n",
-                   evtNum + 1, pid, id, pEvent->EventHeader.ProviderId.Data1, ts);
         }
     }
 }
@@ -1345,101 +1292,6 @@ static bool IsDesktopOrShellWindow(HWND hwnd) {
 }
 
 // Resolves actual rendering process ID for UWP/Modern apps wrapped in ApplicationFrameHost
-static DWORD ResolveForegroundTargetPid(HWND hwnd, DWORD fgPid) {
-    if (!hwnd || fgPid == 0) return fgPid;
-
-    wchar_t exeName[MAX_PATH] = {0};
-    if (GetProcessExeName(fgPid, exeName, MAX_PATH)) {
-        if (_wcsicmp(exeName, L"ApplicationFrameHost.exe") == 0) {
-            // 1. Check direct child window with class "Windows.UI.Core.CoreWindow"
-            HWND hCore = FindWindowExW(hwnd, NULL, L"Windows.UI.Core.CoreWindow", NULL);
-            if (hCore) {
-                DWORD childPid = 0;
-                GetWindowThreadProcessId(hCore, &childPid);
-                if (childPid != 0 && childPid != fgPid) {
-                    return childPid;
-                }
-            }
-
-            // 2. Enumerate child windows to find the real UWP process
-            struct ChildSearch {
-                DWORD hostPid;
-                DWORD foundPid;
-            } cs = { fgPid, 0 };
-
-            EnumChildWindows(hwnd, [](HWND child, LPARAM lParam) -> BOOL {
-                auto* p = reinterpret_cast<ChildSearch*>(lParam);
-                DWORD pid = 0;
-                GetWindowThreadProcessId(child, &pid);
-                if (pid != 0 && pid != p->hostPid) {
-                    p->foundPid = pid;
-                    return FALSE; // Found! Stop enumerating.
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&cs));
-
-            if (cs.foundPid != 0) {
-                return cs.foundPid;
-            }
-
-            // 3. Top-level CoreWindow owned by or titled like this frame
-            wchar_t hostTitle[256] = {0};
-            GetWindowTextW(hwnd, hostTitle, 256);
-
-            struct TopSearch {
-                HWND hostHwnd;
-                DWORD hostPid;
-                const wchar_t* title;
-                DWORD foundPid;
-            } ts = { hwnd, fgPid, hostTitle, 0 };
-
-            EnumWindows([](HWND top, LPARAM lParam) -> BOOL {
-                auto* p = reinterpret_cast<TopSearch*>(lParam);
-                if (top == p->hostHwnd) return TRUE;
-                wchar_t cls[128] = {0};
-                if (GetClassNameW(top, cls, 128) > 0 && _wcsicmp(cls, L"Windows.UI.Core.CoreWindow") == 0) {
-                    HWND owner = GetWindow(top, GW_OWNER);
-                    wchar_t title[256] = {0};
-                    GetWindowTextW(top, title, 256);
-                    if (owner == p->hostHwnd || (p->title[0] != L'\0' && _wcsicmp(title, p->title) == 0)) {
-                        DWORD pid = 0;
-                        GetWindowThreadProcessId(top, &pid);
-                        if (pid != 0 && pid != p->hostPid) {
-                            p->foundPid = pid;
-                            return FALSE;
-                        }
-                    }
-                }
-                return TRUE;
-            }, reinterpret_cast<LPARAM>(&ts));
-
-            if (ts.foundPid != 0) {
-                return ts.foundPid;
-            }
-
-            // 4. Fallback for UWP: find active 3D process in ETW ring buffer
-            uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
-            uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
-            DWORD dwmPid = GetDwmPid();
-            DWORD selfPid = GetCurrentProcessId();
-
-            uint64_t nowTs = GetFileTimeNow();
-
-            for (uint32_t i = 0; i < maxScan; ++i) {
-                uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
-                const auto& frame = g_etwFrameBuf[idx];
-                if (frame.pid != 0 && frame.pid != fgPid && frame.pid != dwmPid && frame.pid != selfPid) {
-                    uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (age < (ETW_TIME_FREQ * 2)) { // within 2 seconds
-                        return frame.pid;
-                    }
-                }
-            }
-        }
-    }
-    return fgPid;
-}
-
 void TelemetryEngine::UpdateFpsAndDisplay() {
     DEVMODEW dm = {};
     dm.dmSize = sizeof(dm);
@@ -1456,14 +1308,13 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
 
     DWORD selfPid = GetCurrentProcessId();
     DWORD dwmPid = GetDwmPid();
-    DWORD resolvedFgPid = ResolveForegroundTargetPid(hwnd, fgPid);
 
-    uint64_t nowTs = GetFileTimeNow();
+    FILETIME nowFt = {};
+    GetSystemTimeAsFileTime(&nowFt);
+    uint64_t nowTs = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
 
     int calculatedFps = 0;
     bool gameActive = false;
-    uint32_t activeCount = 0;
-    uint32_t activeHead = 0;
 
     // 1. Primary: If MSI Afterburner / RTSS is running, check shared memory
     int extFps = 0;
@@ -1472,193 +1323,79 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         calculatedFps = extFps;
         gameActive = extActive;
     } else {
-        // 2. ETW Dynamic 3D Present Detection (Intel PresentMon method, multi-API: DXGI/D3D9/DxgKrnl/UWP)
+        // 2. ETW Dynamic 3D Present Detection (Intel PresentMon method, NO blacklist)
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
-        activeHead = head;
 
-        auto CalculatePidFps = [&](DWORD pid, uint32_t& outCount) -> int {
-            outCount = 0;
-            if (pid == 0 || head == 0) return 0;
+        // Candidate PID selection:
+        // If foreground window is not our own overlay and not DWM, check if foreground is a 3D app
+        DWORD candidatePid = 0;
+        if (fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
+            candidatePid = fgPid;
+        } else if (m_targetGamePid != 0) {
+            // When user clicks our notch overlay or settings, retain currently tracked game
+            candidatePid = m_targetGamePid;
+        }
 
-            uint64_t maxTs = 0;
-            uint64_t minTs = UINT64_MAX;
+        if (candidatePid != 0 && head > 0) {
+            uint64_t latestTs = 0;
             uint32_t count = 0;
+            uint64_t oldestTs = 0;
+            uint64_t windowLimit = ETW_TIME_FREQ; // 1000 ms sliding window
 
             uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
             for (uint32_t i = 0; i < maxScan; ++i) {
                 uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                 const auto& frame = g_etwFrameBuf[idx];
-                if (frame.pid == pid && frame.timestamp > 0) {
+                if (frame.pid == candidatePid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (age > (ETW_TIME_FREQ * 25 / 10)) { // older than 2.5s
-                        if (count > 0) break;
-                        continue;
-                    }
-                    if (frame.timestamp > maxTs) maxTs = frame.timestamp;
-                    if (frame.timestamp < minTs) minTs = frame.timestamp;
-                    count++;
-                    // Once we span at least 1.0 second of frame intervals, we have a complete sample window
-                    if (maxTs > minTs && (maxTs - minTs) >= ETW_TIME_FREQ) {
-                        break;
+                    if (latestTs == 0) {
+                        // If latest present for this process is older than 2.5s, it is not actively rendering 3D
+                        if (age > (ETW_TIME_FREQ * 25 / 10)) {
+                            break;
+                        }
+                        latestTs = frame.timestamp;
+                        oldestTs = frame.timestamp;
+                        count = 1;
+                    } else {
+                        if ((latestTs - frame.timestamp) > windowLimit) {
+                            break; // 1000ms window reached
+                        }
+                        oldestTs = frame.timestamp;
+                        count++;
                     }
                 }
             }
-            outCount = count;
 
-            if (count >= 2 && maxTs > minTs) {
-                double dtSec = static_cast<double>(maxTs - minTs) / static_cast<double>(ETW_TIME_FREQ);
-                if (dtSec >= 0.02) {
+            if (count >= 2 && latestTs > oldestTs) {
+                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(ETW_TIME_FREQ);
+                if (dtSec > 0.02) {
                     double rawFps = static_cast<double>(count - 1) / dtSec;
                     if (rawFps >= 1.0 && rawFps <= 3000.0) {
-                        return static_cast<int>(std::round(rawFps));
-                    }
-                }
-            }
-            return 0;
-        };
-
-        // 1. First priority: Check if foreground window is an active 3D application
-        bool fgIsShell = (hwnd == NULL) || IsDesktopOrShellWindow(hwnd);
-        if (!fgIsShell && resolvedFgPid != 0 && resolvedFgPid != selfPid && resolvedFgPid != dwmPid) {
-            wchar_t exeName[MAX_PATH] = {0};
-            if (GetProcessExeName(resolvedFgPid, exeName, MAX_PATH)) {
-                if (_wcsicmp(exeName, L"explorer.exe") == 0) {
-                    fgIsShell = true;
-                }
-            }
-        }
-
-        if (!fgIsShell && resolvedFgPid != 0 && resolvedFgPid != selfPid && resolvedFgPid != dwmPid) {
-            uint32_t fgCount = 0;
-            int fgFps = CalculatePidFps(resolvedFgPid, fgCount);
-            if (fgCount >= 2 && fgFps > 0) {
-                calculatedFps = fgFps;
-                gameActive = true;
-                m_targetGamePid = resolvedFgPid;
-            }
-        }
-
-        // 2. Second priority: If foreground lost focus (e.g. user hovered/clicked Notch, clicked Desktop, or clicked second screen),
-        // check if our previously locked game (m_targetGamePid) is still actively rendering!
-        if (!gameActive && m_targetGamePid != 0) {
-            uint32_t prevCount = 0;
-            int prevFps = CalculatePidFps(m_targetGamePid, prevCount);
-            if (prevCount >= 2 && prevFps > 0) {
-                calculatedFps = prevFps;
-                gameActive = true;
-            }
-        }
-
-        // 3. Third priority (Crucial for Windowed Games): Dynamic scan of ETW buffer to find ANY active 3D rendering process on the system!
-        // Handles games running in windowed mode that were not clicked yet, or wrapper launchers like League of Legends, Minecraft, etc.
-        if (!gameActive && head > 0) {
-            struct PidInfo {
-                DWORD pid;
-                uint32_t count;
-            };
-            std::vector<PidInfo> activePids;
-
-            uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
-            for (uint32_t i = 0; i < maxScan; ++i) {
-                uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
-                const auto& frame = g_etwFrameBuf[idx];
-                if (frame.pid != 0 && frame.pid != selfPid && frame.pid != dwmPid) {
-                    uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (age < (ETW_TIME_FREQ * 12 / 10)) { // within last 1.2 seconds
-                        bool found = false;
-                        for (auto& item : activePids) {
-                            if (item.pid == frame.pid) {
-                                item.count++;
-                                found = true;
-                                break;
-                            }
+                        int rounded = static_cast<int>(std::round(rawFps));
+                        if (m_stableFps > 0 && std::abs(rawFps - static_cast<double>(m_stableFps)) <= 1.25) {
+                            calculatedFps = m_stableFps;
+                        } else {
+                            calculatedFps = rounded;
                         }
-                        if (!found && activePids.size() < 16) {
-                            activePids.push_back({ frame.pid, 1 });
-                        }
+                        gameActive = true;
+                        m_targetGamePid = candidatePid; // Confirmed active 3D game!
                     }
-                }
-            }
-
-            DWORD bestPid = 0;
-            uint32_t bestCount = 0;
-            for (const auto& item : activePids) {
-                if (item.count >= 3 && item.count > bestCount) {
-                    wchar_t exe[MAX_PATH] = {0};
-                    if (GetProcessExeName(item.pid, exe, MAX_PATH)) {
-                        // Exclude desktop shell, search, and common browser/media processes that render with GPU acceleration
-                        if (_wcsicmp(exe, L"explorer.exe") == 0 ||
-                            _wcsicmp(exe, L"SearchHost.exe") == 0 ||
-                            _wcsicmp(exe, L"StartMenuExperienceHost.exe") == 0 ||
-                            _wcsicmp(exe, L"msedge.exe") == 0 ||
-                            _wcsicmp(exe, L"chrome.exe") == 0 ||
-                            _wcsicmp(exe, L"firefox.exe") == 0 ||
-                            _wcsicmp(exe, L"brave.exe") == 0 ||
-                            _wcsicmp(exe, L"discord.exe") == 0 ||
-                            _wcsicmp(exe, L"LeagueClientUx.exe") == 0 ||
-                            _wcsicmp(exe, L"LeagueClient.exe") == 0 ||
-                            _wcsicmp(exe, L"RiotClientServices.exe") == 0 ||
-                            _wcsicmp(exe, L"Code.exe") == 0) {
-                            continue;
-                        }
-                    }
-                    bestCount = item.count;
-                    bestPid = item.pid;
-                }
-            }
-
-            if (bestPid != 0) {
-                uint32_t scanCount = 0;
-                int scanFps = CalculatePidFps(bestPid, scanCount);
-                if (scanCount >= 2 && scanFps > 0) {
-                    calculatedFps = scanFps;
-                    gameActive = true;
-                    m_targetGamePid = bestPid; // Automatically lock onto windowed 3D game!
                 }
             }
         }
     }
 
     if (gameActive && calculatedFps > 0) {
-        if (m_stableFps == 0) {
-            m_stableFps = calculatedFps;
-        } else {
-            // Calm, stable EMA filter matching Steam / RTSS overlay:
-            int delta = std::abs(calculatedFps - m_stableFps);
-            if (delta <= 2) {
-                // Rock-solid: ignore natural +-1~2 fps measurement jitter
-            } else if (delta <= 6) {
-                // Gentle smoothing
-                m_stableFps = (int)std::round(m_stableFps * 0.75f + calculatedFps * 0.25f);
-            } else {
-                // Significant change (scene transition): respond quickly
-                m_stableFps = (int)std::round(m_stableFps * 0.35f + calculatedFps * 0.65f);
-            }
-        }
+        m_stableFps = calculatedFps;
         m_zeroFpsStreak = 0;
     } else {
         m_zeroFpsStreak++;
-        if (m_zeroFpsStreak >= 8) { // 2~4 seconds grace period before dropping to idle
+        if (m_zeroFpsStreak >= 6) {
             m_stableFps = 0;
         }
-        if (m_zeroFpsStreak >= 24) { // Keep game lock for 6~12 seconds across loading screens
-            m_targetGamePid = 0;
+        if (m_zeroFpsStreak >= 12) {
+            m_targetGamePid = 0; // Release target game after 3+ seconds of non-3D activity
         }
-    }
-
-    static uint64_t s_lastTickLog = 0;
-    uint64_t tickNow = GetTickCount64();
-    if (tickNow - s_lastTickLog >= 1500) {
-        s_lastTickLog = tickNow;
-        wchar_t fgExeName[MAX_PATH] = {0};
-        GetProcessExeName(fgPid, fgExeName, MAX_PATH);
-        wchar_t resExeName[MAX_PATH] = {0};
-        GetProcessExeName(resolvedFgPid, resExeName, MAX_PATH);
-        wchar_t tgtExeName[MAX_PATH] = {0};
-        GetProcessExeName(m_targetGamePid, tgtExeName, MAX_PATH);
-        FpsLog("[Tick] fgPid=%lu (%ls), resPid=%lu (%ls), tgtPid=%lu (%ls), head=%u, calcFps=%d, stableFps=%d, active=%d, streak=%d\n",
-               fgPid, fgExeName, resolvedFgPid, resExeName, m_targetGamePid, tgtExeName,
-               activeHead, calculatedFps, m_stableFps, gameActive ? 1 : 0, m_zeroFpsStreak);
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -1685,7 +1422,7 @@ void TelemetryEngine::StartEtwFpsThread() {
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 1; // High-resolution QPC clock matching PresentMon standard
+        props->Wnode.ClientContext = 1; // QPC clock resolution
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
@@ -1697,35 +1434,28 @@ void TelemetryEngine::StartEtwFpsThread() {
         memset(propBuf.data(), 0, propSize);
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 1; // QPC clock (ProcessTrace delivers 100ns FILETIME)
+        props->Wnode.ClientContext = 1;
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->FlushTimer = 1; // Flush real-time buffers every 1 second
+        props->BufferSize = 64; // 64 KB buffers
+        props->MinimumBuffers = 4;
+        props->MaximumBuffers = 32;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
-
-        bool isElevated = IsCurrentProcessElevated();
-        FpsLog("[ETW Startup] Process elevated=%d, Session: %ls\n", isElevated ? 1 : 0, sessionName);
 
         ULONG status = StartTraceW(&g_hTraceSession, sessionName, props);
         if (status == ERROR_ALREADY_EXISTS) {
             ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
             status = StartTraceW(&g_hTraceSession, sessionName, props);
         }
-        FpsLog("[ETW Startup] StartTraceW status=%lu\n", status);
         if (status != ERROR_SUCCESS) {
-            FpsLog("[ETW Startup] FAILED with status=%lu. (5=Access Denied, elevation required)\n", status);
             return; // Not elevated or ETW restricted
         }
 
-        ULONG sDxgi = EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
-        ULONG sD3d9 = EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
-        ULONG sDxgk = EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
-        ULONG sDwm  = EnableTraceEx2(g_hTraceSession, &DWM_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
-        FpsLog("[ETW Startup] EnableTrace: DXGI=%lu, D3D9=%lu, DXGKRNL=%lu, DWM=%lu\n", sDxgi, sD3d9, sDxgk, sDwm);
+        EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;
@@ -1733,14 +1463,10 @@ void TelemetryEngine::StartEtwFpsThread() {
         logFile.EventRecordCallback = EtwEventRecordCallback;
 
         g_hConsumerTrace = OpenTraceW(&logFile);
-        FpsLog("[ETW Startup] OpenTraceW handle=%p\n", (void*)g_hConsumerTrace);
         if (g_hConsumerTrace != INVALID_PROCESSTRACE_HANDLE) {
-            ULONG ptRes = ProcessTrace(&g_hConsumerTrace, 1, NULL, NULL);
-            FpsLog("[ETW Startup] ProcessTrace ended with status=%lu\n", ptRes);
+            ProcessTrace(&g_hConsumerTrace, 1, NULL, NULL);
             CloseTrace(g_hConsumerTrace);
             g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
-        } else {
-            FpsLog("[ETW Startup] OpenTraceW FAILED, GetLastError=%lu\n", GetLastError());
         }
     });
 }

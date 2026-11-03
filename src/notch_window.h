@@ -106,4 +106,5 @@ private:
     D2D1_RECT_F m_btnMediaFfwdRect = {};
     D2D1_RECT_F m_btnMediaNextRect = {};
     D2D1_RECT_F m_rectMediaSeekBar = {};
+    D2D1_RECT_F m_rectGpuCard = {};
 };

@@ -37,6 +37,7 @@ struct AppConfig {
     bool clickThroughLocked = false;
     int fpsIdleMode = 0;           // 0 = Show "--", 1 = Show Monitor Hz
     bool autoStartAdmin = false;
+    int gpuTarget = 0;             // 0 = Auto (Active Game / Discrete), 1 = AMD Radeon, 2 = NVIDIA GeForce
 
     // Display Monitor & Position Alignment
     int targetMonitor = 0;                  // 0-based monitor index

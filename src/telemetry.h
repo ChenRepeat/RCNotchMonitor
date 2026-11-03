@@ -28,6 +28,9 @@ struct ShmSensorData {
 struct TelemetrySnapshot {
     std::wstring cpuName = L"CPU";
     std::wstring gpuName = L"GPU";
+    std::wstring amdGpuName = L"AMD Radeon(TM) Graphics";
+    std::wstring nvidiaGpuName = L"";
+    int gpuTarget = 0;
 
     int cpuUsagePct = 0;
     int cpuTempC = 0;
@@ -37,6 +40,7 @@ struct TelemetrySnapshot {
 
     int gpuUsagePct = 0;
     int gpuTempC = 0;
+    float gpuClockMhz = 0.0f;
     float gpuVramUsedGb = 0.0f;
     float gpuVramTotalGb = 0.0f;
     float gpuPowerW = 0.0f;
@@ -91,6 +95,11 @@ public:
     void MediaCycleSession();
     void SetPreviewMockMedia(bool enable);
 
+    // GPU Target Selection (0 = Auto/Dynamic, 1 = AMD Radeon, 2 = NVIDIA GeForce)
+    void SetGpuTarget(int target);
+    int GetGpuTarget() const;
+    void CycleGpuTarget();
+
 private:
     void WorkerLoop();
     void InitCpuInfo();
@@ -98,6 +107,8 @@ private:
     void ShutdownNvml();
     void InitAdl();
     void ShutdownAdl();
+    void InitAmdD3DKmt();
+    void ShutdownAmdD3DKmt();
     void InitDxgi();
     void ShutdownDxgi();
     void LaunchSensorBridge();
@@ -127,6 +138,33 @@ private:
     HMODULE m_hNvml = NULL;
     void* m_nvmlDevice = nullptr;
     bool m_nvmlReady = false;
+    DWORD m_lastNvmlRetryTick = 0;
+    std::atomic<int> m_gpuTarget{0};
+
+    // AMD D3DKMT & DXGI telemetry
+    HMODULE m_hGdi32 = NULL;
+    void* m_pfnD3DKMTQuery = nullptr;
+    bool m_amdGpuFound = false;
+    LUID m_amdLuid = {};
+    void* m_amdDxgiAdapter3 = nullptr;
+    ULONGLONG m_prevAmdRunTime = 0;
+    LARGE_INTEGER m_prevAmdQpc = {};
+    int m_amdGpuUsagePct = 0;
+    int m_amdGpuTempC = 0;
+    float m_amdClockMhz = 0.0f;
+    float m_amdVramUsedGb = 0.0f;
+    float m_amdVramTotalGb = 0.0f;
+    float m_amdPowerW = 0.0f;
+
+    // Cached discrete NVIDIA metrics
+    bool m_nvGpuFound = false;
+    int m_nvGpuUsagePct = 0;
+    int m_nvGpuTempC = 0;
+    float m_nvVramUsedGb = 0.0f;
+    float m_nvVramTotalGb = 0.0f;
+    float m_nvPowerW = 0.0f;
+    float m_nvClockMhz = 0.0f;
+    std::wstring m_nvGpuName = L"";
 
     // AMD ADL dynamic bindings
     HMODULE m_hAdl = NULL;

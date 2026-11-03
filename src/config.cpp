@@ -53,6 +53,7 @@ void AppConfig::ResetDefaults() {
     clickThroughLocked = false;
     fpsIdleMode = 0;
     autoStartAdmin = false;
+    gpuTarget = 0;
 
     targetMonitor = 0;
     targetMonitorDevice = L"";
@@ -232,6 +233,7 @@ bool AppConfig::LoadFromFile(const std::wstring& path) {
     clickThroughLocked = ExtractJsonBool(json, L"clickThroughLocked", clickThroughLocked);
     fpsIdleMode = std::clamp(ExtractJsonInt(json, L"fpsIdleMode", fpsIdleMode), 0, 1);
     autoStartAdmin = ExtractJsonBool(json, L"autoStartAdmin", autoStartAdmin);
+    gpuTarget = std::clamp(ExtractJsonInt(json, L"gpuTarget", gpuTarget), 0, 2);
 
     targetMonitor = std::max(0, ExtractJsonInt(json, L"targetMonitor", targetMonitor));
     targetMonitorDevice = ExtractJsonString(json, L"targetMonitorDevice", targetMonitorDevice);
@@ -289,6 +291,7 @@ bool AppConfig::SaveToFile(const std::wstring& path) const {
     ss << L"  \"clickThroughLocked\": " << (clickThroughLocked ? L"true" : L"false") << L",\n";
     ss << L"  \"fpsIdleMode\": " << fpsIdleMode << L",\n";
     ss << L"  \"autoStartAdmin\": " << (autoStartAdmin ? L"true" : L"false") << L",\n";
+    ss << L"  \"gpuTarget\": " << gpuTarget << L",\n";
     ss << L"  \"targetMonitor\": " << targetMonitor << L",\n";
     ss << L"  \"targetMonitorDevice\": \"" << targetMonitorDevice << L"\",\n";
     ss << L"  \"positionOffsetPct\": " << positionOffsetPct << L",\n";

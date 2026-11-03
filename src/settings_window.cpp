@@ -57,7 +57,8 @@ enum {
     ZONE_INSP_TITLE = 122,
     ZONE_INSP_TCOL = 123,
     ZONE_INSP_VCOL = 124,
-    ZONE_INSP_MEDIADOCK = 125
+    ZONE_INSP_MEDIADOCK = 125,
+    ZONE_INSP_GPUTARGET = 126
 };
 
 static COLORREF g_customColors[16] = {
@@ -809,34 +810,61 @@ void SettingsWindow::RenderToTarget(ID2D1RenderTarget* rt, int w, int h) {
 
         // 1. Enable Toggle
         std::wstring enTxt = std::wstring(mc.enabled ? L"啟用: " : L"停用: ") + shortNames[mIdx];
-        drawButton(ZONE_INSP_ENABLE, enTxt, 32, 566, 152, 48, mc.enabled, blockIcons[mIdx]);
+        if (mIdx == 1) {
+            drawButton(ZONE_INSP_ENABLE, enTxt, 32, 566, 116, 48, mc.enabled, blockIcons[mIdx]);
+            drawButton(ZONE_INSP_TEMP, mc.showTemp ? L"顯示 °C" : L"隱藏 °C", 156, 566, 110, 48, mc.showTemp, FA_ICON_THERM);
+            std::wstring gpuTgtTxt = (m_config->gpuTarget == 0) ? L"目標: 自動" :
+                                     (m_config->gpuTarget == 1) ? L"目標: AMD" : L"目標: NVIDIA";
+            drawButton(ZONE_INSP_GPUTARGET, gpuTgtTxt, 274, 566, 136, 48, m_config->gpuTarget != 0, FA_ICON_GPU);
 
-        // 2. Show Temp Toggle (CPU/GPU only)
-        if (mIdx == 0 || mIdx == 1) {
-            drawButton(ZONE_INSP_TEMP, mc.showTemp ? L"顯示 °C" : L"隱藏 °C", 194, 566, 136, 48, mc.showTemp, FA_ICON_THERM);
+            // 3. Editable Custom Title Input Box
+            D2D1_RECT_F rcTitleBox = D2D1::RectF(418, 566, 558, 614);
+            addZone(ZONE_INSP_TITLE, rcTitleBox);
+            bool focused = (m_focusedTitleRow == mIdx);
+            bool hovTitle = (m_hoveredZone == ZONE_INSP_TITLE);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 6.0f, 6.0f), brTrack);
+            rt->DrawRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 6.0f, 6.0f),
+                                     (focused || hovTitle) ? brSelect : brBorder,
+                                     focused ? 1.8f : 1.0f);
+            std::wstring dispTitle = L"標題: " + mc.title + (focused ? L"|" : L"");
+            rt->DrawText(dispTitle.c_str(), (UINT32)dispTitle.size(), fmtBtn, rcTitleBox, brText);
+
+            // 4. Title Color Swatch
+            std::wstring tHex = L"標題 " + ColorToHex(mc.titleColor);
+            drawSwatch(ZONE_INSP_TCOL, tHex.c_str(), mc.titleColor, 566, 566, 126, 48);
+
+            // 5. Value Color Swatch
+            std::wstring vHex = L"數值 " + ColorToHex(mc.valueColor);
+            drawSwatch(ZONE_INSP_VCOL, vHex.c_str(), mc.valueColor, 700, 566, 126, 48);
         } else {
-            drawButton(ZONE_INSP_TEMP, L"無溫度項", 194, 566, 136, 48, false, -1, true);
+            drawButton(ZONE_INSP_ENABLE, enTxt, 32, 566, 152, 48, mc.enabled, blockIcons[mIdx]);
+            // 2. Show Temp Toggle (CPU only)
+            if (mIdx == 0) {
+                drawButton(ZONE_INSP_TEMP, mc.showTemp ? L"顯示 °C" : L"隱藏 °C", 194, 566, 136, 48, mc.showTemp, FA_ICON_THERM);
+            } else {
+                drawButton(ZONE_INSP_TEMP, L"無溫度項", 194, 566, 136, 48, false, -1, true);
+            }
+
+            // 3. Editable Custom Title Input Box
+            D2D1_RECT_F rcTitleBox = D2D1::RectF(340, 566, 506, 614);
+            addZone(ZONE_INSP_TITLE, rcTitleBox);
+            bool focused = (m_focusedTitleRow == mIdx);
+            bool hovTitle = (m_hoveredZone == ZONE_INSP_TITLE);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 6.0f, 6.0f), brTrack);
+            rt->DrawRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 6.0f, 6.0f),
+                                     (focused || hovTitle) ? brSelect : brBorder,
+                                     focused ? 1.8f : 1.0f);
+            std::wstring dispTitle = L"標題: " + mc.title + (focused ? L"|" : L"");
+            rt->DrawText(dispTitle.c_str(), (UINT32)dispTitle.size(), fmtBtn, rcTitleBox, brText);
+
+            // 4. Title Color Swatch
+            std::wstring tHex = L"標題 " + ColorToHex(mc.titleColor);
+            drawSwatch(ZONE_INSP_TCOL, tHex.c_str(), mc.titleColor, 516, 566, 150, 48);
+
+            // 5. Value Color Swatch
+            std::wstring vHex = L"數值 " + ColorToHex(mc.valueColor);
+            drawSwatch(ZONE_INSP_VCOL, vHex.c_str(), mc.valueColor, 676, 566, 152, 48);
         }
-
-        // 3. Editable Custom Title Input Box
-        D2D1_RECT_F rcTitleBox = D2D1::RectF(340, 566, 506, 614);
-        addZone(ZONE_INSP_TITLE, rcTitleBox);
-        bool focused = (m_focusedTitleRow == mIdx);
-        bool hovTitle = (m_hoveredZone == ZONE_INSP_TITLE);
-        rt->FillRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 6.0f, 6.0f), brTrack);
-        rt->DrawRoundedRectangle(D2D1::RoundedRect(rcTitleBox, 6.0f, 6.0f),
-                                 (focused || hovTitle) ? brSelect : brBorder,
-                                 focused ? 1.8f : 1.0f);
-        std::wstring dispTitle = L"標題: " + mc.title + (focused ? L"|" : L"");
-        rt->DrawText(dispTitle.c_str(), (UINT32)dispTitle.size(), fmtBtn, rcTitleBox, brText);
-
-        // 4. Title Color Swatch
-        std::wstring tHex = L"標題 " + ColorToHex(mc.titleColor);
-        drawSwatch(ZONE_INSP_TCOL, tHex.c_str(), mc.titleColor, 516, 566, 150, 48);
-
-        // 5. Value Color Swatch
-        std::wstring vHex = L"數值 " + ColorToHex(mc.valueColor);
-        drawSwatch(ZONE_INSP_VCOL, vHex.c_str(), mc.valueColor, 676, 566, 152, 48);
     } else {
         // Selected Block == 4 (MEDIA 媒體)
         drawButton(ZONE_INSP_ENABLE,
@@ -1102,6 +1130,10 @@ void SettingsWindow::HandleZoneClick(int zoneId, float mx, float my, const D2D1_
             m_config->metrics[m_selectedBlock].showTemp = !m_config->metrics[m_selectedBlock].showTemp;
             NotifyChanged();
         }
+        return;
+    case ZONE_INSP_GPUTARGET:
+        m_config->gpuTarget = (m_config->gpuTarget + 1) % 3;
+        NotifyChanged();
         return;
     case ZONE_INSP_TITLE:
         if (m_selectedBlock >= 0 && m_selectedBlock < 4) {

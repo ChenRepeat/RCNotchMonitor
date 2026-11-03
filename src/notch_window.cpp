@@ -126,6 +126,9 @@ bool NotchWindow::Create(HINSTANCE hInstance, AppConfig* config, TelemetryEngine
     m_hInstance = hInstance;
     m_config = config;
     m_telemetry = telemetry;
+    if (m_telemetry && m_config) {
+        m_telemetry->SetGpuTarget(m_config->gpuTarget);
+    }
 
     if (!InitD2D()) return false;
 
@@ -212,6 +215,7 @@ void NotchWindow::ApplyConfig() {
     SetTimer(m_hwnd, TIMER_DATA_ID, m_config->refreshIntervalMs, NULL);
     if (m_telemetry) {
         m_telemetry->SetIntervalMs(m_config->refreshIntervalMs);
+        m_telemetry->SetGpuTarget(m_config->gpuTarget);
     }
     RenderAndPresent();
 }
@@ -404,6 +408,13 @@ LRESULT NotchWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             } else if (PointInRectF(mx, my, m_btnLockRect)) {
                 SetClickThrough(true);
+                m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
+                if (onConfigChanged) onConfigChanged();
+                RenderAndPresent();
+                return 0;
+            } else if (PointInRectF(mx, my, m_rectGpuCard) && m_telemetry) {
+                m_config->gpuTarget = (m_config->gpuTarget + 1) % 3;
+                m_telemetry->SetGpuTarget(m_config->gpuTarget);
                 m_config->SaveToFile(AppConfig::GetDefaultConfigPath());
                 if (onConfigChanged) onConfigChanged();
                 RenderAndPresent();
@@ -661,11 +672,18 @@ void NotchWindow::DrawRoundedAlbumArt(ID2D1RenderTarget* rt, const D2D1_RECT_F& 
             D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
         );
         if (SUCCEEDED(rt->CreateBitmapBrush(m_albumBitmap, bbp, &bmpBrush)) && bmpBrush) {
-            float sx = w / std::max(1.0f, (float)m_albumBitmapW);
-            float sy = h / std::max(1.0f, (float)m_albumBitmapH);
+            // Keep aspect ratio without deformation: fill height ("把高撐滿") and center horizontally ("致中")
+            float bmpW = std::max(1.0f, (float)m_albumBitmapW);
+            float bmpH = std::max(1.0f, (float)m_albumBitmapH);
+            float scale = std::max(w / bmpW, h / bmpH);
+            float drawBmpW = bmpW * scale;
+            float drawBmpH = bmpH * scale;
+            float transX = rc.left + (w - drawBmpW) * 0.5f;
+            float transY = rc.top + (h - drawBmpH) * 0.5f;
+
             bmpBrush->SetTransform(
-                D2D1::Matrix3x2F::Scale(sx, sy) *
-                D2D1::Matrix3x2F::Translation(rc.left, rc.top)
+                D2D1::Matrix3x2F::Scale(scale, scale) *
+                D2D1::Matrix3x2F::Translation(transX, transY)
             );
             bmpBrush->SetOpacity(alpha);
             rt->FillRoundedRectangle(D2D1::RoundedRect(rc, radius, radius), bmpBrush);
@@ -1377,7 +1395,15 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     rawCards[0].pct = snap.cpuUsagePct / 100.0f;
 
     rawCards[1].icon = FA_ICON_GPU;
-    rawCards[1].title = m_config->metrics[1].title;
+    std::wstring gpuCardTitle = m_config->metrics[1].title;
+    if (m_config->gpuTarget == 1) {
+        gpuCardTitle += L" (AMD)";
+    } else if (m_config->gpuTarget == 2) {
+        gpuCardTitle += L" (NV)";
+    } else {
+        gpuCardTitle += (snap.gpuName.find(L"AMD") != std::wstring::npos) ? L" (AMD)" : L" (NV)";
+    }
+    rawCards[1].title = gpuCardTitle;
     rawCards[1].titleCol = m_config->metrics[1].titleColor;
     rawCards[1].val1Col = m_config->metrics[1].valueColor;
     rawCards[1].val2Col = (snap.gpuTempC >= m_config->tempCritC) ? m_config->critColor :
@@ -1385,7 +1411,11 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
     rawCards[1].hasTemp = true;
     swprintf(rawCards[1].val1, 32, L"%d%%", snap.gpuUsagePct);
     swprintf(rawCards[1].val2, 32, L"%d°C", snap.gpuTempC);
-    swprintf(rawCards[1].subVal, 64, L"VRAM %.1f/%.0fG • %.0fW", snap.gpuVramUsedGb, snap.gpuVramTotalGb, snap.gpuPowerW);
+    if (snap.gpuClockMhz > 100.0f) {
+        swprintf(rawCards[1].subVal, 64, L"VRAM %.1f/%.0fG • %.0fW • %.0fMHz", snap.gpuVramUsedGb, snap.gpuVramTotalGb, snap.gpuPowerW, snap.gpuClockMhz);
+    } else {
+        swprintf(rawCards[1].subVal, 64, L"VRAM %.1f/%.0fG • %.0fW", snap.gpuVramUsedGb, snap.gpuVramTotalGb, snap.gpuPowerW);
+    }
     rawCards[1].pct = snap.gpuUsagePct / 100.0f;
 
     rawCards[2].icon = FA_ICON_RAM;
@@ -1426,6 +1456,9 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
         float y = gridTop + r * (cardH + gap);
 
         D2D1_RECT_F rcCard = D2D1::RectF(x, y, x + cardW, y + cardH);
+        if (mIdx == 1) {
+            m_rectGpuCard = rcCard;
+        }
         if (brCardBg) {
             rt->FillRoundedRectangle(D2D1::RoundedRect(rcCard, cardRadius, cardRadius), brCardBg);
         }

@@ -965,17 +965,25 @@ void NotchWindow::DrawCollapsedContent(ID2D1RenderTarget* rt, float w, float h, 
             swprintf(buf1, 32, L"%d%%", snap.cpuUsagePct);
             if (mc.showTemp) {
                 items[i].hasTemp = true;
-                swprintf(buf2, 32, L"%d°C", snap.cpuTempC);
-                if (snap.cpuTempC >= m_config->tempCritC) items[i].val2Col = m_config->critColor;
-                else if (snap.cpuTempC >= m_config->tempWarnC) items[i].val2Col = m_config->warnColor;
+                if (snap.cpuTempC > 0) {
+                    swprintf(buf2, 32, L"%d°C", snap.cpuTempC);
+                    if (snap.cpuTempC >= m_config->tempCritC) items[i].val2Col = m_config->critColor;
+                    else if (snap.cpuTempC >= m_config->tempWarnC) items[i].val2Col = m_config->warnColor;
+                } else {
+                    swprintf(buf2, 32, L"--");
+                }
             }
         } else if (mIdx == 1) { // GPU
             swprintf(buf1, 32, L"%d%%", snap.gpuUsagePct);
             if (mc.showTemp) {
                 items[i].hasTemp = true;
-                swprintf(buf2, 32, L"%d°C", snap.gpuTempC);
-                if (snap.gpuTempC >= m_config->tempCritC) items[i].val2Col = m_config->critColor;
-                else if (snap.gpuTempC >= m_config->tempWarnC) items[i].val2Col = m_config->warnColor;
+                if (snap.gpuTempC > 0) {
+                    swprintf(buf2, 32, L"%d°C", snap.gpuTempC);
+                    if (snap.gpuTempC >= m_config->tempCritC) items[i].val2Col = m_config->critColor;
+                    else if (snap.gpuTempC >= m_config->tempWarnC) items[i].val2Col = m_config->warnColor;
+                } else {
+                    swprintf(buf2, 32, L"--");
+                }
             }
         } else if (mIdx == 2) { // RAM
             swprintf(buf1, 32, L"%d%%", snap.ramUsagePct);
@@ -1390,8 +1398,16 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
                           (snap.cpuTempC >= m_config->tempWarnC) ? m_config->warnColor : m_config->metrics[0].valueColor;
     rawCards[0].hasTemp = true;
     swprintf(rawCards[0].val1, 32, L"%d%%", snap.cpuUsagePct);
-    swprintf(rawCards[0].val2, 32, L"%d°C", snap.cpuTempC);
-    swprintf(rawCards[0].subVal, 64, L"%.2f GHz  •  %.0f W", snap.cpuClockGhz, snap.cpuPowerW);
+    if (snap.cpuTempC > 0) {
+        swprintf(rawCards[0].val2, 32, L"%d°C", snap.cpuTempC);
+    } else {
+        swprintf(rawCards[0].val2, 32, L"--");
+    }
+    if (snap.cpuPowerW > 1.0f) {
+        swprintf(rawCards[0].subVal, 64, L"%.2f GHz  •  %.0f W", snap.cpuClockGhz, snap.cpuPowerW);
+    } else {
+        swprintf(rawCards[0].subVal, 64, L"%.2f GHz", snap.cpuClockGhz);
+    }
     rawCards[0].pct = snap.cpuUsagePct / 100.0f;
 
     rawCards[1].icon = FA_ICON_GPU;
@@ -1410,7 +1426,11 @@ void NotchWindow::DrawExpandedContent(ID2D1RenderTarget* rt, float w, float h, f
                           (snap.gpuTempC >= m_config->tempWarnC) ? m_config->warnColor : m_config->metrics[1].valueColor;
     rawCards[1].hasTemp = true;
     swprintf(rawCards[1].val1, 32, L"%d%%", snap.gpuUsagePct);
-    swprintf(rawCards[1].val2, 32, L"%d°C", snap.gpuTempC);
+    if (snap.gpuTempC > 0) {
+        swprintf(rawCards[1].val2, 32, L"%d°C", snap.gpuTempC);
+    } else {
+        swprintf(rawCards[1].val2, 32, L"--");
+    }
     if (snap.gpuClockMhz > 100.0f) {
         swprintf(rawCards[1].subVal, 64, L"VRAM %.1f/%.0fG • %.0fW • %.0fMHz", snap.gpuVramUsedGb, snap.gpuVramTotalGb, snap.gpuPowerW, snap.gpuClockMhz);
     } else {

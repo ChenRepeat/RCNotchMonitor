@@ -407,10 +407,129 @@ struct EtwFrameRecord {
 };
 
 constexpr size_t ETW_FRAME_BUF_SIZE = 1024;
-constexpr uint64_t ETW_TIME_FREQ = 10000000ULL; // Windows 100ns FILETIME units = 10 MHz
 static EtwFrameRecord g_etwFrameBuf[ETW_FRAME_BUF_SIZE] = {};
 static std::atomic<uint32_t> g_etwFrameHead{0};
 static uint64_t g_qpcFreq = 0;
+
+static inline uint64_t GetQpcFreq() {
+    if (g_qpcFreq == 0) {
+        LARGE_INTEGER freq = {};
+        QueryPerformanceFrequency(&freq);
+        g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
+    }
+    return (g_qpcFreq > 0) ? g_qpcFreq : 10000000ULL;
+}
+
+static inline uint64_t GetQpcNow() {
+    LARGE_INTEGER qpc = {};
+    QueryPerformanceCounter(&qpc);
+    return static_cast<uint64_t>(qpc.QuadPart);
+}
+
+// =========================================================================
+// HWiNFO64 Shared Memory Reader (Global\\HWiNFO_SENS_SM2)
+// Provides 100% genuine hardware sensors (CPU Tctl/Tdie, Package Power, Clocks)
+// Zero-driver, zero-elevation, standard IPC used by CapFrameX & Rainmeter
+// =========================================================================
+#pragma pack(push, 1)
+struct HWiNFOHeader {
+    uint32_t magic;                 // 'SiWH' = 0x53695748
+    uint32_t version;
+    uint32_t version2;
+    int64_t  last_update;
+    uint32_t sensor_section_offset;
+    uint32_t sensor_element_size;
+    uint32_t sensor_element_count;
+    uint32_t entry_section_offset;
+    uint32_t entry_element_size;
+    uint32_t entry_element_count;
+};
+
+struct HWiNFOSensor {
+    uint32_t dwSensorID;
+    uint32_t dwSensorInst;
+    char     szSensorNameOrig[128];
+    char     szSensorNameUser[128];
+};
+
+struct HWiNFOReading {
+    uint32_t tReading; // 1 = Temp, 5 = Power, 6 = Clock, 7 = Usage
+    uint32_t dwSensorIndex;
+    uint32_t dwReadingID;
+    char     szLabelOrig[128];
+    char     szLabelUser[128];
+    char     szUnit[16];
+    double   Value;
+    double   ValueMin;
+    double   ValueMax;
+    double   ValueAvg;
+};
+#pragma pack(pop)
+
+static bool ReadHwInfoSensors(int& outCpuTemp, float& outCpuPower, float& outCpuClockGhz) {
+    HANDLE hMapFile = OpenFileMappingA(FILE_MAP_READ, FALSE, "Global\\HWiNFO_SENS_SM2");
+    if (!hMapFile) {
+        hMapFile = OpenFileMappingA(FILE_MAP_READ, FALSE, "HWiNFO_SENS_SM2");
+    }
+    if (!hMapFile) return false;
+
+    void* pSharedMem = MapViewOfFile(hMapFile, FILE_MAP_READ, 0, 0, 0);
+    if (!pSharedMem) {
+        CloseHandle(hMapFile);
+        return false;
+    }
+
+    bool found = false;
+    auto* pHeader = static_cast<const HWiNFOHeader*>(pSharedMem);
+    if (pHeader->magic == 0x53695748 && pHeader->entry_section_offset > 0 && pHeader->entry_element_count > 0) {
+        const uint8_t* basePtr = static_cast<const uint8_t*>(pSharedMem);
+        const auto* readings = reinterpret_cast<const HWiNFOReading*>(basePtr + pHeader->entry_section_offset);
+
+        int bestTemp = 0;
+        float bestPower = 0.0f;
+        float bestClock = 0.0f;
+
+        for (uint32_t i = 0; i < pHeader->entry_element_count; ++i) {
+            const auto& r = readings[i];
+            const char* label = (r.szLabelUser[0] != 0) ? r.szLabelUser : r.szLabelOrig;
+
+            // Reading Type 1: Temperature (Celsius)
+            if (r.tReading == 1 && r.Value > 10.0 && r.Value < 120.0) {
+                // AMD: "CPU (Tctl/Tdie)", "CPU Die (average)", "CPU CCD1 (Tdie)"
+                // Intel: "CPU Package", "Core Max"
+                if (strstr(label, "Tctl") != nullptr || strstr(label, "CPU (Tctl/Tdie)") != nullptr) {
+                    bestTemp = static_cast<int>(std::round(r.Value));
+                    found = true;
+                } else if (bestTemp == 0 && (strstr(label, "CPU Package") != nullptr || strstr(label, "CPU Die") != nullptr || strstr(label, "Core Max") != nullptr)) {
+                    bestTemp = static_cast<int>(std::round(r.Value));
+                    found = true;
+                }
+            }
+            // Reading Type 5: Power (Watts)
+            else if (r.tReading == 5 && r.Value > 1.0 && r.Value < 500.0) {
+                if (strstr(label, "CPU Package Power") != nullptr || strstr(label, "CPU PPT") != nullptr || strstr(label, "Core Power") != nullptr) {
+                    bestPower = static_cast<float>(r.Value);
+                }
+            }
+            // Reading Type 6: Clock (MHz)
+            else if (r.tReading == 6 && r.Value > 200.0 && r.Value < 8000.0) {
+                if (strstr(label, "Core Clocks (avg)") != nullptr || strstr(label, "CPU Clock") != nullptr) {
+                    bestClock = static_cast<float>(r.Value) / 1000.0f;
+                }
+            }
+        }
+
+        if (found && bestTemp > 0) {
+            outCpuTemp = bestTemp;
+            if (bestPower > 1.0f) outCpuPower = bestPower;
+            if (bestClock > 0.5f) outCpuClockGhz = bestClock;
+        }
+    }
+
+    UnmapViewOfFile(pSharedMem);
+    CloseHandle(hMapFile);
+    return found;
+}
 
 static TRACEHANDLE g_hTraceSession = 0;
 static TRACEHANDLE g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
@@ -464,12 +583,10 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     }
 
     if (isPresent) {
-        // Industry-Standard: ETW events use 100ns FILETIME units (10,000,000 / sec)
+        // High-Precision QPC matching ClientContext == 1
         uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
         if (ts == 0) {
-            FILETIME ft = {};
-            GetSystemTimeAsFileTime(&ft);
-            ts = (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            ts = GetQpcNow();
         }
 
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
@@ -478,7 +595,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
             // Deduplication: if within 0.5ms (supports up to 2000 FPS) for the same process,
             // this is an MPO / DxgKrnl / DXGI duplicate event for the exact same frame!
             if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
-                (ts - prev.timestamp) < (ETW_TIME_FREQ / 2000)) {
+                (ts - prev.timestamp) < (GetQpcFreq() / 2000)) {
                 return;
             }
         }
@@ -897,6 +1014,8 @@ void TelemetryEngine::UpdateCpuAndRam(const ShmSensorData& shm, bool shmValid) {
         fromRealSensor = true;
         if (mahm.cpuPowerW > 1.0f) cpuPower = mahm.cpuPowerW;
         if (mahm.cpuClockMhz > 100.0f) clockGhz = mahm.cpuClockMhz / 1000.0f;
+    } else if (ReadHwInfoSensors(cpuTemp, cpuPower, clockGhz)) {
+        fromRealSensor = true;
     } else if (shmValid && shm.cpuTempC > 10 && shm.cpuTempC < 115) {
         cpuTemp = (int)std::round(shm.cpuTempC);
         cpuPower = shm.cpuPowerW;
@@ -904,15 +1023,11 @@ void TelemetryEngine::UpdateCpuAndRam(const ShmSensorData& shm, bool shmValid) {
     }
 
     if (!fromRealSensor) {
-        // Calibrated Zen 5 X3D (Ryzen 7 9800X3D) thermal curve:
-        // Idle baseline is ~50-52°C; boost (>4.5GHz) and load scale to ~65-75°C
-        float rawTarget = 52.0f + (cpuLoad * 0.42f);
-        if (clockGhz > 4.2f) {
-            rawTarget += (clockGhz - 4.2f) * 8.5f;
-        }
-        m_smoothedCpuTemp += (rawTarget - m_smoothedCpuTemp) * 0.22f;
-        cpuTemp = std::clamp((int)std::round(m_smoothedCpuTemp), 38, 95);
-        cpuPower = 28.0f + (cpuLoad * 0.85f);
+        // Industry-Standard Honest Policy (matching Steam overlay):
+        // Never display artificial math formulas or simulated curves disguised as chip temperature.
+        // If no real kernel driver / shared memory sensor is present, leave as 0 (shows "--").
+        cpuTemp = 0;
+        cpuPower = 0.0f;
     }
 
     // 4. System RAM usage
@@ -1200,16 +1315,15 @@ static DWORD ResolveForegroundTargetPid(HWND hwnd, DWORD fgPid) {
             DWORD dwmPid = GetDwmPid();
             DWORD selfPid = GetCurrentProcessId();
 
-            FILETIME nowFt = {};
-            GetSystemTimeAsFileTime(&nowFt);
-            uint64_t nowTs = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+            uint64_t nowTs = GetQpcNow();
+            uint64_t qpcFreq = GetQpcFreq();
 
             for (uint32_t i = 0; i < maxScan; ++i) {
                 uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                 const auto& frame = g_etwFrameBuf[idx];
                 if (frame.pid != 0 && frame.pid != fgPid && frame.pid != dwmPid && frame.pid != selfPid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (age < (ETW_TIME_FREQ * 2)) { // within 2 seconds
+                    if (age < (qpcFreq * 2)) { // within 2 seconds
                         return frame.pid;
                     }
                 }
@@ -1237,9 +1351,8 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     DWORD dwmPid = GetDwmPid();
     DWORD resolvedFgPid = ResolveForegroundTargetPid(hwnd, fgPid);
 
-    FILETIME nowFt = {};
-    GetSystemTimeAsFileTime(&nowFt);
-    uint64_t nowTs = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+    uint64_t nowTs = GetQpcNow();
+    uint64_t qpcFreq = GetQpcFreq();
 
     int calculatedFps = 0;
     bool gameActive = false;
@@ -1271,7 +1384,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             uint64_t latestTs = 0;
             uint32_t count = 0;
             uint64_t oldestTs = 0;
-            uint64_t windowLimit = ETW_TIME_FREQ; // 1000 ms sliding window
+            uint64_t windowLimit = qpcFreq; // 1000 ms sliding window
 
             uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
             for (uint32_t i = 0; i < maxScan; ++i) {
@@ -1281,7 +1394,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
                     if (latestTs == 0) {
                         // If latest present for this process is older than 2.5s, it is not actively rendering 3D
-                        if (age > (ETW_TIME_FREQ * 25 / 10)) {
+                        if (age > (qpcFreq * 25 / 10)) {
                             break;
                         }
                         latestTs = frame.timestamp;
@@ -1299,7 +1412,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             activeCount = count;
 
             if (count >= 2 && latestTs > oldestTs) {
-                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(ETW_TIME_FREQ);
+                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(qpcFreq);
                 if (dtSec > 0.02) {
                     double rawFps = static_cast<double>(count - 1) / dtSec;
                     if (rawFps >= 1.0 && rawFps <= 3000.0) {

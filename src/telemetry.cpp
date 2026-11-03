@@ -407,23 +407,14 @@ struct EtwFrameRecord {
 };
 
 constexpr size_t ETW_FRAME_BUF_SIZE = 1024;
+constexpr uint64_t ETW_TIME_FREQ = 10000000ULL; // Standard Windows 100ns FILETIME units (10 MHz)
 static EtwFrameRecord g_etwFrameBuf[ETW_FRAME_BUF_SIZE] = {};
 static std::atomic<uint32_t> g_etwFrameHead{0};
-static uint64_t g_qpcFreq = 0;
 
-static inline uint64_t GetQpcFreq() {
-    if (g_qpcFreq == 0) {
-        LARGE_INTEGER freq = {};
-        QueryPerformanceFrequency(&freq);
-        g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
-    }
-    return (g_qpcFreq > 0) ? g_qpcFreq : 10000000ULL;
-}
-
-static inline uint64_t GetQpcNow() {
-    LARGE_INTEGER qpc = {};
-    QueryPerformanceCounter(&qpc);
-    return static_cast<uint64_t>(qpc.QuadPart);
+static inline uint64_t GetFileTimeNow() {
+    FILETIME ft = {};
+    GetSystemTimeAsFileTime(&ft);
+    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
 // =========================================================================
@@ -586,10 +577,10 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     }
 
     if (isPresent) {
-        // High-Precision QPC matching ClientContext == 1
+        // Windows ETW delivers EventHeader.TimeStamp in system time (100ns FILETIME)
         uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
         if (ts == 0) {
-            ts = GetQpcNow();
+            ts = GetFileTimeNow();
         }
 
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
@@ -598,7 +589,7 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
             // Deduplication: if within 0.5ms (supports up to 2000 FPS) for the same process,
             // this is an MPO / DxgKrnl / DXGI duplicate event for the exact same frame!
             if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
-                (ts - prev.timestamp) < (GetQpcFreq() / 2000)) {
+                (ts - prev.timestamp) < (ETW_TIME_FREQ / 2000)) {
                 return;
             }
         }
@@ -638,11 +629,7 @@ TelemetryEngine::TelemetryEngine(bool verifyMockMode) {
         m_prevKernelTime = FileTimeToU64(kernel);
         m_prevUserTime = FileTimeToU64(user);
     }
-    if (g_qpcFreq == 0) {
-        LARGE_INTEGER freq = {};
-        QueryPerformanceFrequency(&freq);
-        g_qpcFreq = static_cast<uint64_t>(freq.QuadPart);
-    }
+
 }
 
 TelemetryEngine::~TelemetryEngine() {
@@ -1382,15 +1369,14 @@ static DWORD ResolveForegroundTargetPid(HWND hwnd, DWORD fgPid) {
             DWORD dwmPid = GetDwmPid();
             DWORD selfPid = GetCurrentProcessId();
 
-            uint64_t nowTs = GetQpcNow();
-            uint64_t qpcFreq = GetQpcFreq();
+            uint64_t nowTs = GetFileTimeNow();
 
             for (uint32_t i = 0; i < maxScan; ++i) {
                 uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                 const auto& frame = g_etwFrameBuf[idx];
                 if (frame.pid != 0 && frame.pid != fgPid && frame.pid != dwmPid && frame.pid != selfPid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (age < (qpcFreq * 2)) { // within 2 seconds
+                    if (age < (ETW_TIME_FREQ * 2)) { // within 2 seconds
                         return frame.pid;
                     }
                 }
@@ -1418,8 +1404,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     DWORD dwmPid = GetDwmPid();
     DWORD resolvedFgPid = ResolveForegroundTargetPid(hwnd, fgPid);
 
-    uint64_t nowTs = GetQpcNow();
-    uint64_t qpcFreq = GetQpcFreq();
+    uint64_t nowTs = GetFileTimeNow();
 
     int calculatedFps = 0;
     bool gameActive = false;
@@ -1444,7 +1429,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             uint64_t latestTs = 0;
             uint32_t count = 0;
             uint64_t oldestTs = 0;
-            uint64_t windowLimit = qpcFreq; // 1000 ms sliding window
+            uint64_t windowLimit = ETW_TIME_FREQ; // 1000 ms sliding window
 
             uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
             for (uint32_t i = 0; i < maxScan; ++i) {
@@ -1453,7 +1438,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 if (frame.pid == pid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
                     if (latestTs == 0) {
-                        if (age > (qpcFreq * 2)) {
+                        if (age > (ETW_TIME_FREQ * 25 / 10)) { // 2.5s
                             break;
                         }
                         latestTs = frame.timestamp;
@@ -1471,7 +1456,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             outCount = count;
 
             if (count >= 2 && latestTs > oldestTs) {
-                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(qpcFreq);
+                double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(ETW_TIME_FREQ);
                 if (dtSec > 0.02) {
                     double rawFps = static_cast<double>(count - 1) / dtSec;
                     if (rawFps >= 1.0 && rawFps <= 3000.0) {
@@ -1529,7 +1514,7 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 const auto& frame = g_etwFrameBuf[idx];
                 if (frame.pid != 0 && frame.pid != selfPid && frame.pid != dwmPid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                    if (age < qpcFreq) { // within last 1 second
+                    if (age < (ETW_TIME_FREQ * 12 / 10)) { // within last 1.2 seconds
                         bool found = false;
                         for (auto& item : activePids) {
                             if (item.pid == frame.pid) {
@@ -1551,9 +1536,16 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 if (item.count >= 3 && item.count > bestCount) {
                     wchar_t exe[MAX_PATH] = {0};
                     if (GetProcessExeName(item.pid, exe, MAX_PATH)) {
+                        // Exclude desktop shell, search, and common browser/media processes that render with GPU acceleration
                         if (_wcsicmp(exe, L"explorer.exe") == 0 ||
                             _wcsicmp(exe, L"SearchHost.exe") == 0 ||
-                            _wcsicmp(exe, L"StartMenuExperienceHost.exe") == 0) {
+                            _wcsicmp(exe, L"StartMenuExperienceHost.exe") == 0 ||
+                            _wcsicmp(exe, L"msedge.exe") == 0 ||
+                            _wcsicmp(exe, L"chrome.exe") == 0 ||
+                            _wcsicmp(exe, L"firefox.exe") == 0 ||
+                            _wcsicmp(exe, L"brave.exe") == 0 ||
+                            _wcsicmp(exe, L"discord.exe") == 0 ||
+                            _wcsicmp(exe, L"Code.exe") == 0) {
                             continue;
                         }
                     }
@@ -1572,24 +1564,32 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                 }
             }
         }
-
-        if (gameActive && calculatedFps > 0) {
-            if (m_stableFps > 0 && std::abs(calculatedFps - m_stableFps) <= 1) {
-                calculatedFps = m_stableFps;
-            }
-        }
     }
 
     if (gameActive && calculatedFps > 0) {
-        m_stableFps = calculatedFps;
+        if (m_stableFps == 0) {
+            m_stableFps = calculatedFps;
+        } else {
+            // Calm, stable EMA filter matching Steam / RTSS overlay:
+            int delta = std::abs(calculatedFps - m_stableFps);
+            if (delta <= 2) {
+                // Rock-solid: ignore natural +-1~2 fps measurement jitter
+            } else if (delta <= 6) {
+                // Gentle smoothing
+                m_stableFps = (int)std::round(m_stableFps * 0.75f + calculatedFps * 0.25f);
+            } else {
+                // Significant change (scene transition): respond quickly
+                m_stableFps = (int)std::round(m_stableFps * 0.35f + calculatedFps * 0.65f);
+            }
+        }
         m_zeroFpsStreak = 0;
     } else {
         m_zeroFpsStreak++;
-        if (m_zeroFpsStreak >= 6) {
+        if (m_zeroFpsStreak >= 8) { // 2~4 seconds grace period before dropping to idle
             m_stableFps = 0;
         }
-        if (m_zeroFpsStreak >= 12) {
-            m_targetGamePid = 0; // Release target game after 3+ seconds of non-3D activity
+        if (m_zeroFpsStreak >= 24) { // Keep game lock for 6~12 seconds across loading screens
+            m_targetGamePid = 0;
         }
     }
 
@@ -1617,7 +1617,7 @@ void TelemetryEngine::StartEtwFpsThread() {
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 1; // QPC clock resolution
+        props->Wnode.ClientContext = 2; // System time (FILETIME, 100ns)
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
@@ -1629,7 +1629,7 @@ void TelemetryEngine::StartEtwFpsThread() {
         memset(propBuf.data(), 0, propSize);
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 1;
+        props->Wnode.ClientContext = 2;
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->FlushTimer = 1; // Flush real-time buffers every 1 second
         props->BufferSize = 64; // 64 KB buffers

@@ -1284,37 +1284,26 @@ void TelemetryEngine::UpdateGpu(const ShmSensorData& shm, bool shmValid) {
     }
 }
 
-static bool IsForegroundWindowFullscreenGame(DWORD& outPid) {
-    outPid = 0;
-    HWND hwnd = GetForegroundWindow();
-    if (!hwnd) return false;
-    GetWindowThreadProcessId(hwnd, &outPid);
-    if (outPid == 0 || outPid == GetCurrentProcessId()) return false;
-
-    wchar_t clsName[128] = {0};
-    GetClassNameW(hwnd, clsName, 128);
-    // Ignore standard desktop/shell/explorer/browser classes when checking fullscreen game
-    if (wcscmp(clsName, L"Progman") == 0 ||
-        wcscmp(clsName, L"WorkerW") == 0 ||
-        wcscmp(clsName, L"Shell_TrayWnd") == 0 ||
-        wcscmp(clsName, L"CabinetWClass") == 0) {
-        return false;
+static bool IsKnownNonGameProcess(const wchar_t* exeName) {
+    if (!exeName || !exeName[0]) return false;
+    static const wchar_t* s_blackList[] = {
+        L"explorer.exe", L"SearchHost.exe", L"StartMenuExperienceHost.exe",
+        L"ShellExperienceHost.exe", L"ApplicationFrameHost.exe", L"SystemSettings.exe",
+        L"taskmgr.exe", L"cmd.exe", L"powershell.exe", L"conhost.exe", L"SnippingTool.exe",
+        L"TextInputHost.exe", L"ctfmon.exe", L"sihost.exe", L"smartscreen.exe",
+        L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe",
+        L"notepad.exe", L"notepad++.exe", L"code.exe", L"devenv.exe",
+        L"WINWORD.EXE", L"EXCEL.EXE", L"POWERPNT.EXE",
+        L"discord.exe", L"LINE.exe", L"slack.exe", L"teams.exe", L"ms-teams.exe",
+        L"Telegram.exe", L"WeChat.exe",
+        L"steam.exe", L"steamwebhelper.exe", L"EpicGamesLauncher.exe",
+        L"Battle.net.exe", L"RiotClientServices.exe",
+        L"RCNotchMonitor.exe"
+    };
+    for (const auto* name : s_blackList) {
+        if (_wcsicmp(exeName, name) == 0) return true;
     }
-
-    // Check executable name for common desktop apps
-    bool isFullscreen = false;
-    RECT rcWin = {};
-    if (GetWindowRect(hwnd, &rcWin)) {
-        int scrW = GetSystemMetrics(SM_CXSCREEN);
-        int scrH = GetSystemMetrics(SM_CYSCREEN);
-        if ((rcWin.right - rcWin.left) >= scrW && (rcWin.bottom - rcWin.top) >= scrH) {
-            LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-            if (!(style & WS_CAPTION)) {
-                isFullscreen = true;
-            }
-        }
-    }
-    return isFullscreen;
+    return false;
 }
 
 static bool IsDesktopOrShellWindow(HWND hwnd) {
@@ -1324,7 +1313,26 @@ static bool IsDesktopOrShellWindow(HWND hwnd) {
     if (_wcsicmp(cls, L"Progman") == 0 ||
         _wcsicmp(cls, L"WorkerW") == 0 ||
         _wcsicmp(cls, L"Shell_TrayWnd") == 0 ||
-        _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0) {
+        _wcsicmp(cls, L"Shell_SecondaryTrayWnd") == 0 ||
+        _wcsicmp(cls, L"CabinetWClass") == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool IsWindowFullscreenOrGame(HWND hwnd) {
+    if (!hwnd) return false;
+    RECT rc = {};
+    if (!GetWindowRect(hwnd, &rc)) return false;
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int scrH = GetSystemMetrics(SM_CYSCREEN);
+    int winW = rc.right - rc.left;
+    int winH = rc.bottom - rc.top;
+    if (winW >= (scrW - 16) && winH >= (scrH - 16)) {
+        return true;
+    }
+    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    if (!(style & WS_CAPTION)) {
         return true;
     }
     return false;
@@ -1364,31 +1372,57 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         // 2. High-Performance Universal Presentation Engine (DirectX 9/11/12, Vulkan, OpenGL, DWM)
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
 
-        bool fgIsShell = (hwnd == NULL) || IsDesktopOrShellWindow(hwnd);
-        if (!fgIsShell && fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
-            wchar_t exeName[MAX_PATH] = {0};
-            if (GetProcessExeName(fgPid, exeName, MAX_PATH)) {
-                if (_wcsicmp(exeName, L"explorer.exe") == 0 ||
-                    _wcsicmp(exeName, L"SearchHost.exe") == 0 ||
-                    _wcsicmp(exeName, L"StartMenuExperienceHost.exe") == 0) {
-                    fgIsShell = true;
-                }
-            }
+        wchar_t fgExeName[MAX_PATH] = {0};
+        if (fgPid != 0) {
+            GetProcessExeName(fgPid, fgExeName, MAX_PATH);
         }
 
+        bool fgIsShell = (hwnd == NULL) || IsDesktopOrShellWindow(hwnd) ||
+                         (_wcsicmp(fgExeName, L"explorer.exe") == 0) ||
+                         (_wcsicmp(fgExeName, L"SearchHost.exe") == 0) ||
+                         (_wcsicmp(fgExeName, L"StartMenuExperienceHost.exe") == 0);
+
         DWORD candidatePid = 0;
-        if (!fgIsShell && fgPid != 0 && fgPid != selfPid && fgPid != dwmPid) {
-            candidatePid = fgPid;
-            m_targetGamePid = fgPid;
-        } else if (m_targetGamePid != 0) {
-            candidatePid = m_targetGamePid;
+        bool isCandidateGame = false;
+
+        if (fgIsShell) {
+            // Explicitly on desktop / explorer / start menu -> NOT in a game
+            m_targetGamePid = 0;
+            candidatePid = 0;
+        } else if (fgPid == selfPid) {
+            // User clicked notch window -> retain target game if still alive
+            if (m_targetGamePid != 0) {
+                HANDLE hTest = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, m_targetGamePid);
+                if (hTest) {
+                    DWORD exitCode = 0;
+                    if (GetExitCodeProcess(hTest, &exitCode) && exitCode == STILL_ACTIVE) {
+                        candidatePid = m_targetGamePid;
+                        isCandidateGame = true;
+                    } else {
+                        m_targetGamePid = 0;
+                    }
+                    CloseHandle(hTest);
+                } else {
+                    m_targetGamePid = 0;
+                }
+            }
+        } else if (fgPid != 0 && fgPid != dwmPid) {
+            if (!IsKnownNonGameProcess(fgExeName)) {
+                candidatePid = fgPid;
+                m_targetGamePid = fgPid;
+                isCandidateGame = true;
+            } else {
+                // Known 2D desktop app in foreground (Browser, Discord, Notepad, etc.)
+                m_targetGamePid = 0;
+                candidatePid = 0;
+            }
         }
 
         if (candidatePid != 0 && head > 0) {
             uint64_t latestTs = 0;
             uint32_t count = 0;
             uint64_t oldestTs = 0;
-            uint64_t windowLimit = timeFreq; // exactly 1000 ms sliding window in QPC ticks
+            uint64_t windowLimit = timeFreq; // exactly 1000 ms sliding window in FILETIME units
             uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
 
             // Pass A: Direct game presents from candidatePid (DXGI / D3D9)
@@ -1411,25 +1445,29 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             }
 
             // Pass B: For Anti-cheat protected games (Monster Hunter Wilds, LoL Vanguard) or OpenGL/Vulkan,
-            // user-mode DXGI is isolated, so we correlate with DWM hardware composition presents (dwmPid)
-            if (count < 2) {
-                latestTs = 0;
-                count = 0;
-                oldestTs = 0;
-                for (uint32_t i = 0; i < maxScan; ++i) {
-                    uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
-                    const auto& frame = g_etwFrameBuf[idx];
-                    if (frame.isDwm || (dwmPid != 0 && frame.pid == dwmPid)) {
-                        uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
-                        if (latestTs == 0) {
-                            if (age > (timeFreq * 25 / 10)) break;
-                            latestTs = frame.timestamp;
-                            oldestTs = frame.timestamp;
-                            count = 1;
-                        } else {
-                            if (frame.timestamp < latestTs && (latestTs - frame.timestamp) > windowLimit) break;
-                            oldestTs = frame.timestamp;
-                            count++;
+            // user-mode DXGI is isolated, so we correlate with DWM hardware composition presents (dwmPid).
+            // ONLY enabled if candidate is confirmed as a 3D game window or gaming GPU load!
+            if (count < 2 && isCandidateGame) {
+                bool qualifiesForDwm = IsWindowFullscreenOrGame(hwnd) || (m_snapshot.gpuUsagePct >= 20);
+                if (qualifiesForDwm) {
+                    latestTs = 0;
+                    count = 0;
+                    oldestTs = 0;
+                    for (uint32_t i = 0; i < maxScan; ++i) {
+                        uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
+                        const auto& frame = g_etwFrameBuf[idx];
+                        if (frame.isDwm || (dwmPid != 0 && frame.pid == dwmPid)) {
+                            uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
+                            if (latestTs == 0) {
+                                if (age > (timeFreq * 25 / 10)) break;
+                                latestTs = frame.timestamp;
+                                oldestTs = frame.timestamp;
+                                count = 1;
+                            } else {
+                                if (frame.timestamp < latestTs && (latestTs - frame.timestamp) > windowLimit) break;
+                                oldestTs = frame.timestamp;
+                                count++;
+                            }
                         }
                     }
                 }

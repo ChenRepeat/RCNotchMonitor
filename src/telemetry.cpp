@@ -180,6 +180,43 @@ static uint64_t FileTimeToU64(const FILETIME& ft) {
     return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
+static bool IsCurrentProcessElevated() {
+    bool elevated = false;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elev = {};
+        DWORD cbSize = sizeof(elev);
+        if (GetTokenInformation(hToken, TokenElevation, &elev, sizeof(elev), &cbSize)) {
+            elevated = (elev.TokenIsElevated != 0);
+        }
+        CloseHandle(hToken);
+    }
+    return elevated;
+}
+
+static void FpsLog(const char* fmt, ...) {
+    static FILE* s_fp = nullptr;
+    static bool s_opened = false;
+    static std::mutex s_logMutex;
+    std::lock_guard<std::mutex> lock(s_logMutex);
+    if (!s_opened) {
+        s_opened = true;
+        wchar_t exePath[MAX_PATH] = {0};
+        GetModuleFileNameW(NULL, exePath, MAX_PATH);
+        wchar_t* p = wcsrchr(exePath, L'\\');
+        if (p) *(p + 1) = L'\0';
+        std::wstring logPath = std::wstring(exePath) + L"fps_debug.log";
+        s_fp = _wfopen(logPath.c_str(), L"w");
+    }
+    if (s_fp) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(s_fp, fmt, args);
+        va_end(args);
+        fflush(s_fp);
+    }
+}
+
 // Global pointer for ETW callback
 static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 
@@ -600,6 +637,13 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
         g_etwFrameHead.store(head + 1, std::memory_order_release);
         if (g_pEtwFrameCounter) {
             g_pEtwFrameCounter->fetch_add(1, std::memory_order_relaxed);
+        }
+
+        static std::atomic<int> s_loggedEvents{0};
+        int evtNum = s_loggedEvents.fetch_add(1, std::memory_order_relaxed);
+        if (evtNum < 80) {
+            FpsLog("[ETW Event #%d] pid=%lu, id=%u, prov=0x%08X, ts=%llu\n",
+                   evtNum + 1, pid, id, pEvent->EventHeader.ProviderId.Data1, ts);
         }
     }
 }
@@ -1593,6 +1637,21 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         }
     }
 
+    static uint64_t s_lastTickLog = 0;
+    uint64_t tickNow = GetTickCount64();
+    if (tickNow - s_lastTickLog >= 1500) {
+        s_lastTickLog = tickNow;
+        wchar_t fgExeName[MAX_PATH] = {0};
+        GetProcessExeName(fgPid, fgExeName, MAX_PATH);
+        wchar_t resExeName[MAX_PATH] = {0};
+        GetProcessExeName(resolvedFgPid, resExeName, MAX_PATH);
+        wchar_t tgtExeName[MAX_PATH] = {0};
+        GetProcessExeName(m_targetGamePid, tgtExeName, MAX_PATH);
+        FpsLog("[Tick] fgPid=%lu (%ls), resPid=%lu (%ls), tgtPid=%lu (%ls), head=%u, calcFps=%d, stableFps=%d, active=%d, streak=%d\n",
+               fgPid, fgExeName, resolvedFgPid, resExeName, m_targetGamePid, tgtExeName,
+               activeHead, calculatedFps, m_stableFps, gameActive ? 1 : 0, m_zeroFpsStreak);
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
     m_snapshot.monitorRefreshHz = hz;
     if (m_stableFps > 0) {
@@ -1638,21 +1697,27 @@ void TelemetryEngine::StartEtwFpsThread() {
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
 
+        bool isElevated = IsCurrentProcessElevated();
+        FpsLog("[ETW Startup] Process elevated=%d, Session: %ls\n", isElevated ? 1 : 0, sessionName);
+
         ULONG status = StartTraceW(&g_hTraceSession, sessionName, props);
         if (status == ERROR_ALREADY_EXISTS) {
             ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
             status = StartTraceW(&g_hTraceSession, sessionName, props);
         }
+        FpsLog("[ETW Startup] StartTraceW status=%lu\n", status);
         if (status != ERROR_SUCCESS) {
+            FpsLog("[ETW Startup] FAILED with status=%lu. (5=Access Denied, elevation required)\n", status);
             return; // Not elevated or ETW restricted
         }
 
-        EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        ULONG sDxgi = EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        ULONG sD3d9 = EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+        ULONG sDxgk = EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+        FpsLog("[ETW Startup] EnableTrace: DXGI=%lu, D3D9=%lu, DXGKRNL=%lu\n", sDxgi, sD3d9, sDxgk);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;
@@ -1660,10 +1725,14 @@ void TelemetryEngine::StartEtwFpsThread() {
         logFile.EventRecordCallback = EtwEventRecordCallback;
 
         g_hConsumerTrace = OpenTraceW(&logFile);
+        FpsLog("[ETW Startup] OpenTraceW handle=%p\n", (void*)g_hConsumerTrace);
         if (g_hConsumerTrace != INVALID_PROCESSTRACE_HANDLE) {
-            ProcessTrace(&g_hConsumerTrace, 1, NULL, NULL);
+            ULONG ptRes = ProcessTrace(&g_hConsumerTrace, 1, NULL, NULL);
+            FpsLog("[ETW Startup] ProcessTrace ended with status=%lu\n", ptRes);
             CloseTrace(g_hConsumerTrace);
             g_hConsumerTrace = INVALID_PROCESSTRACE_HANDLE;
+        } else {
+            FpsLog("[ETW Startup] OpenTraceW FAILED, GetLastError=%lu\n", GetLastError());
         }
     });
 }

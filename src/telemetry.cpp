@@ -620,12 +620,10 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (isPresent) {
         uint64_t ts = static_cast<uint64_t>(pEvent->EventHeader.TimeStamp.QuadPart);
         if (ts == 0) {
-            LARGE_INTEGER qpcNow = {};
-            QueryPerformanceCounter(&qpcNow);
-            ts = static_cast<uint64_t>(qpcNow.QuadPart);
+            ts = GetFileTimeNow();
         }
 
-        uint64_t minInterval = (GetQpcFreq() > 0) ? (GetQpcFreq() / 2000) : 5000ULL; // 0.5ms (supports up to 2000 FPS)
+        uint64_t minInterval = 5000ULL; // 0.5ms in 100ns FILETIME units
         uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
         if (head > 0) {
             const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
@@ -1350,10 +1348,8 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
     DWORD selfPid = GetCurrentProcessId();
     DWORD dwmPid = GetDwmPid();
 
-    LARGE_INTEGER qpcNow = {};
-    QueryPerformanceCounter(&qpcNow);
-    uint64_t nowTs = static_cast<uint64_t>(qpcNow.QuadPart);
-    uint64_t timeFreq = (GetQpcFreq() > 0) ? GetQpcFreq() : 10000000ULL;
+    uint64_t nowTs = GetFileTimeNow();
+    uint64_t timeFreq = ETW_TIME_FREQ; // Standard Windows 100ns FILETIME units (10 MHz)
 
     int calculatedFps = 0;
     bool gameActive = false;
@@ -1516,6 +1512,17 @@ void TelemetryEngine::StartEtwFpsThread() {
         ULONG status = StartTraceW(&g_hTraceSession, sessionName, props);
         if (status == ERROR_ALREADY_EXISTS) {
             ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_STOP);
+            memset(propBuf.data(), 0, propSize);
+            props->Wnode.BufferSize = propSize;
+            props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+            props->Wnode.ClientContext = 1;
+            props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+            props->FlushTimer = 1;
+            props->BufferSize = 64;
+            props->MinimumBuffers = 4;
+            props->MaximumBuffers = 32;
+            props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+            props->LogFileNameOffset = 0;
             status = StartTraceW(&g_hTraceSession, sessionName, props);
         }
         if (status != ERROR_SUCCESS) {

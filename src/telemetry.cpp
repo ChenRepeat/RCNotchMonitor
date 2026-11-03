@@ -575,11 +575,14 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     bool isPresent = false;
 
     if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGI_PROVIDER_GUID)) {
-        if (id == 42 || id == 55) isPresent = true;
+        // 42 = Present_Start, 55 = PresentMultiplaneOverlay_Start, 39 = SwapChain_Present_Start (Windowed), 53 = SwapChain_PresentMPO (Windowed)
+        if (id == 42 || id == 55 || id == 39 || id == 53) isPresent = true;
     } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, D3D9_PROVIDER_GUID)) {
-        if (id == 1) isPresent = true;
+        // 1 = Present_Start, 4 = PresentEx_Start (D3D9Ex Windowed Flip)
+        if (id == 1 || id == 4) isPresent = true;
     } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGKRNL_PROVIDER_GUID)) {
-        if (id == 184 || id == 171) isPresent = true;
+        // 184 = Present_Start, 171 = SubmitPresentHistory (Windowed Blt/Flip), 178 = SubmitPresentHistory_Start, 169 = Flip_Start, 311 = Token_PresentHistory
+        if (id == 184 || id == 171 || id == 178 || id == 169 || id == 311) isPresent = true;
     }
 
     if (isPresent) {
@@ -1434,17 +1437,10 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
         uint32_t head = g_etwFrameHead.load(std::memory_order_acquire);
         activeHead = head;
 
-        // Candidate PID selection:
-        // If foreground window is not our own overlay and not DWM, check if foreground is a 3D app
-        DWORD candidatePid = 0;
-        if (resolvedFgPid != 0 && resolvedFgPid != selfPid && resolvedFgPid != dwmPid) {
-            candidatePid = resolvedFgPid;
-        } else if (m_targetGamePid != 0) {
-            // When user clicks our notch overlay or settings, retain currently tracked game
-            candidatePid = m_targetGamePid;
-        }
+        auto CalculatePidFps = [&](DWORD pid, uint32_t& outCount) -> int {
+            outCount = 0;
+            if (pid == 0 || head == 0) return 0;
 
-        if (candidatePid != 0 && head > 0) {
             uint64_t latestTs = 0;
             uint32_t count = 0;
             uint64_t oldestTs = 0;
@@ -1454,11 +1450,10 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
             for (uint32_t i = 0; i < maxScan; ++i) {
                 uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
                 const auto& frame = g_etwFrameBuf[idx];
-                if (frame.pid == candidatePid) {
+                if (frame.pid == pid) {
                     uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
                     if (latestTs == 0) {
-                        // If latest present for this process is older than 2.5s, it is not actively rendering 3D
-                        if (age > (qpcFreq * 25 / 10)) {
+                        if (age > (qpcFreq * 2)) {
                             break;
                         }
                         latestTs = frame.timestamp;
@@ -1466,30 +1461,121 @@ void TelemetryEngine::UpdateFpsAndDisplay() {
                         count = 1;
                     } else {
                         if ((latestTs - frame.timestamp) > windowLimit) {
-                            break; // 1000ms window reached
+                            break;
                         }
                         oldestTs = frame.timestamp;
                         count++;
                     }
                 }
             }
-            activeCount = count;
+            outCount = count;
 
             if (count >= 2 && latestTs > oldestTs) {
                 double dtSec = static_cast<double>(latestTs - oldestTs) / static_cast<double>(qpcFreq);
                 if (dtSec > 0.02) {
                     double rawFps = static_cast<double>(count - 1) / dtSec;
                     if (rawFps >= 1.0 && rawFps <= 3000.0) {
-                        int rounded = static_cast<int>(std::round(rawFps));
-                        if (m_stableFps > 0 && std::abs(rawFps - static_cast<double>(m_stableFps)) <= 1.25) {
-                            calculatedFps = m_stableFps;
-                        } else {
-                            calculatedFps = rounded;
-                        }
-                        gameActive = true;
-                        m_targetGamePid = candidatePid; // Confirmed active 3D game!
+                        return static_cast<int>(std::round(rawFps));
                     }
                 }
+            }
+            return 0;
+        };
+
+        // 1. First priority: Check if foreground window is an active 3D application
+        bool fgIsShell = (hwnd == NULL) || IsDesktopOrShellWindow(hwnd);
+        if (!fgIsShell && resolvedFgPid != 0 && resolvedFgPid != selfPid && resolvedFgPid != dwmPid) {
+            wchar_t exeName[MAX_PATH] = {0};
+            if (GetProcessExeName(resolvedFgPid, exeName, MAX_PATH)) {
+                if (_wcsicmp(exeName, L"explorer.exe") == 0) {
+                    fgIsShell = true;
+                }
+            }
+        }
+
+        if (!fgIsShell && resolvedFgPid != 0 && resolvedFgPid != selfPid && resolvedFgPid != dwmPid) {
+            uint32_t fgCount = 0;
+            int fgFps = CalculatePidFps(resolvedFgPid, fgCount);
+            if (fgCount >= 2 && fgFps > 0) {
+                calculatedFps = fgFps;
+                gameActive = true;
+                m_targetGamePid = resolvedFgPid;
+            }
+        }
+
+        // 2. Second priority: If foreground lost focus (e.g. user hovered/clicked Notch, clicked Desktop, or clicked second screen),
+        // check if our previously locked game (m_targetGamePid) is still actively rendering!
+        if (!gameActive && m_targetGamePid != 0) {
+            uint32_t prevCount = 0;
+            int prevFps = CalculatePidFps(m_targetGamePid, prevCount);
+            if (prevCount >= 2 && prevFps > 0) {
+                calculatedFps = prevFps;
+                gameActive = true;
+            }
+        }
+
+        // 3. Third priority (Crucial for Windowed Games): Dynamic scan of ETW buffer to find ANY active 3D rendering process on the system!
+        // Handles games running in windowed mode that were not clicked yet, or wrapper launchers like League of Legends, Minecraft, etc.
+        if (!gameActive && head > 0) {
+            struct PidInfo {
+                DWORD pid;
+                uint32_t count;
+            };
+            std::vector<PidInfo> activePids;
+
+            uint32_t maxScan = (head < ETW_FRAME_BUF_SIZE) ? head : static_cast<uint32_t>(ETW_FRAME_BUF_SIZE);
+            for (uint32_t i = 0; i < maxScan; ++i) {
+                uint32_t idx = (head - 1 - i) & (ETW_FRAME_BUF_SIZE - 1);
+                const auto& frame = g_etwFrameBuf[idx];
+                if (frame.pid != 0 && frame.pid != selfPid && frame.pid != dwmPid) {
+                    uint64_t age = (nowTs >= frame.timestamp) ? (nowTs - frame.timestamp) : (frame.timestamp - nowTs);
+                    if (age < qpcFreq) { // within last 1 second
+                        bool found = false;
+                        for (auto& item : activePids) {
+                            if (item.pid == frame.pid) {
+                                item.count++;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found && activePids.size() < 16) {
+                            activePids.push_back({ frame.pid, 1 });
+                        }
+                    }
+                }
+            }
+
+            DWORD bestPid = 0;
+            uint32_t bestCount = 0;
+            for (const auto& item : activePids) {
+                if (item.count >= 3 && item.count > bestCount) {
+                    wchar_t exe[MAX_PATH] = {0};
+                    if (GetProcessExeName(item.pid, exe, MAX_PATH)) {
+                        if (_wcsicmp(exe, L"explorer.exe") == 0 ||
+                            _wcsicmp(exe, L"SearchHost.exe") == 0 ||
+                            _wcsicmp(exe, L"StartMenuExperienceHost.exe") == 0) {
+                            continue;
+                        }
+                    }
+                    bestCount = item.count;
+                    bestPid = item.pid;
+                }
+            }
+
+            if (bestPid != 0) {
+                uint32_t scanCount = 0;
+                int scanFps = CalculatePidFps(bestPid, scanCount);
+                if (scanCount >= 2 && scanFps > 0) {
+                    calculatedFps = scanFps;
+                    gameActive = true;
+                    m_targetGamePid = bestPid; // Automatically lock onto windowed 3D game!
+                }
+            }
+        }
+
+        if (gameActive && calculatedFps > 0) {
+            if (m_stableFps > 0 && std::abs(calculatedFps - m_stableFps) <= 1) {
+                calculatedFps = m_stableFps;
             }
         }
     }
@@ -1565,12 +1651,8 @@ void TelemetryEngine::StartEtwFpsThread() {
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
         EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        ULONG sDxg = EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                   TRACE_LEVEL_INFORMATION, 0x10000, 0, 0, NULL);
-        if (sDxg != ERROR_SUCCESS) {
-            EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                           TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        }
+        EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;

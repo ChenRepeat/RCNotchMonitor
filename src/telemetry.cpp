@@ -211,7 +211,9 @@ static std::atomic<uint32_t>* g_pEtwFrameCounter = nullptr;
 static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9 } };
 // Microsoft-Windows-D3D9: {783ACA0A-790E-4D7F-8451-AA850511C6B9}
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
-// Microsoft-Windows-Dwm-Core: {9E9BBA3C-2E38-40CB-99F4-9E8281425164} (Hardware / Composition Presentation)
+// Microsoft-Windows-DxgKrnl: {802EC45A-1E99-4B83-9920-87C98277BA9D} (Kernel Graphics Subsystem - Anti-cheat Immune)
+static const GUID DXGKRNL_PROVIDER_GUID = { 0x802EC45A, 0x1E99, 0x4B83, { 0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D } };
+// Microsoft-Windows-Dwm-Core: {9E9BBA3C-2E38-40CB-99F4-9E8281425164} (Hardware / DirectFlip / Composition Presentation)
 static const GUID DWM_PROVIDER_GUID = { 0x9E9BBA3C, 0x2E38, 0x40CB, { 0x99, 0xF4, 0x9E, 0x82, 0x81, 0x42, 0x51, 0x64 } };
 
 // -----------------------------------------------------------------------------
@@ -602,15 +604,18 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     bool isDwmEvent = false;
 
     // Supported Presentation Events:
-    // DXGI: 42 (Present_Start), 55 (PresentMultiplaneOverlay_Start)
-    // D3D9: 1 (Present_Start)
-    // DWM:  57 (Dwm_VSync_Frame / Frame Presented to screen)
+    // 1. DXGI: 42 (Present_Start), 55 (PresentMultiplaneOverlay_Start)
+    // 2. D3D9: 1 (Present_Start)
+    // 3. DxgKrnl: Kernel graphics presentation (anti-cheat immune)
+    // 4. DWM-Core: DirectFlip & Composition Presents (15, 16, 141, 145, 467, 468, 476)
     if (prov1 == 0xCA11C036 /* DXGI */) {
         if (id == 42 || id == 55) isPresent = true;
     } else if (prov1 == 0x783ACA0A /* D3D9 */) {
         if (id == 1) isPresent = true;
+    } else if (prov1 == 0x802EC45A /* DxgKrnl */) {
+        isPresent = true;
     } else if (prov1 == 0x9E9BBA3C /* DWM */) {
-        if (id == 57) {
+        if (id == 15 || id == 16 || id == 141 || id == 145 || id == 467 || id == 468 || id == 476) {
             isPresent = true;
             isDwmEvent = true;
             g_dwmPid.store(pid, std::memory_order_relaxed);
@@ -623,16 +628,26 @@ static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
             ts = GetFileTimeNow();
         }
 
-        uint64_t minInterval = 5000ULL; // 0.5ms in 100ns FILETIME units
-        uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
-        if (head > 0) {
-            const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
-            if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
-                (ts - prev.timestamp) < minInterval) {
+        // Deduplicate events occurring within the same frame (< 2.0 ms = 20000 FILETIME ticks)
+        static std::atomic<uint64_t> s_lastDwmTimestamp{0};
+        if (isDwmEvent) {
+            uint64_t last = s_lastDwmTimestamp.load(std::memory_order_relaxed);
+            if (last > 0 && ts >= last && (ts - last) < 20000ULL) {
                 return;
+            }
+            s_lastDwmTimestamp.store(ts, std::memory_order_relaxed);
+        } else {
+            uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
+            if (head > 0) {
+                const auto& prev = g_etwFrameBuf[(head - 1) & (ETW_FRAME_BUF_SIZE - 1)];
+                if (prev.pid == pid && prev.timestamp > 0 && (ts >= prev.timestamp) &&
+                    (ts - prev.timestamp) < 20000ULL) {
+                    return;
+                }
             }
         }
 
+        uint32_t head = g_etwFrameHead.load(std::memory_order_relaxed);
         uint32_t slot = head & (ETW_FRAME_BUF_SIZE - 1);
         g_etwFrameBuf[slot].timestamp = ts;
         g_etwFrameBuf[slot].pid = pid;
@@ -1572,9 +1587,12 @@ void TelemetryEngine::StartEtwFpsThread() {
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
         EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
                        TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
-        // DWM FrameRate provider with Keyword 0x8 (DwmFrameRate - emits ONLY per-frame presents, zero noise)
+        // DxgKrnl Kernel Graphics Subsystem provider with Keyword 0x08000000 (Present)
+        EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0x08000000ULL /* Present */, 0, 0, NULL);
+        // DWM FrameRate & Scheduling & DirectFlip provider (0x1 Composition | 0x80 Scheduling | 0x200 Overlays)
         EnableTraceEx2(g_hTraceSession, &DWM_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0x8 /* DwmFrameRate */, 0, 0, NULL);
+                       TRACE_LEVEL_INFORMATION, 0x281ULL, 0, 0, NULL);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;

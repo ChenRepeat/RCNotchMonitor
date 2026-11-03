@@ -226,6 +226,8 @@ static const GUID DXGI_PROVIDER_GUID = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xA
 static const GUID D3D9_PROVIDER_GUID = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
 // Microsoft-Windows-DxgKrnl: {802EC45A-1E99-4B83-9920-87C98277BA9D} (OpenGL / Vulkan / WDDM Presentation)
 static const GUID DXGKRNL_PROVIDER_GUID = { 0x802EC45A, 0x1E99, 0x4B83, { 0x99, 0x20, 0x87, 0xC9, 0x82, 0x77, 0xBA, 0x9D } };
+// Microsoft-Windows-Dwm-Core: {9E9BBA3C-2E38-40CB-99F4-9E8281425164}
+static const GUID DWM_PROVIDER_GUID = { 0x9E9BBA3C, 0x2E38, 0x40CB, { 0x99, 0xF4, 0x9E, 0x82, 0x81, 0x42, 0x51, 0x64 } };
 
 // -----------------------------------------------------------------------------
 // MSI Afterburner & RivaTuner Statistics Server (RTSS) Shared Memory Structures
@@ -1716,12 +1718,14 @@ void TelemetryEngine::StartEtwFpsThread() {
         }
 
         ULONG sDxgi = EnableTraceEx2(g_hTraceSession, &DXGI_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
         ULONG sD3d9 = EnableTraceEx2(g_hTraceSession, &D3D9_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
         ULONG sDxgk = EnableTraceEx2(g_hTraceSession, &DXGKRNL_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                       TRACE_LEVEL_INFORMATION, 0x1, 0, 0, NULL);
-        FpsLog("[ETW Startup] EnableTrace: DXGI=%lu, D3D9=%lu, DXGKRNL=%lu\n", sDxgi, sD3d9, sDxgk);
+                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
+        ULONG sDwm  = EnableTraceEx2(g_hTraceSession, &DWM_PROVIDER_GUID, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                       TRACE_LEVEL_INFORMATION, 0xFFFFFFFFFFFFFFFFULL, 0, 0, NULL);
+        FpsLog("[ETW Startup] EnableTrace: DXGI=%lu, D3D9=%lu, DXGKRNL=%lu, DWM=%lu\n", sDxgi, sD3d9, sDxgk, sDwm);
 
         EVENT_TRACE_LOGFILEW logFile = {};
         logFile.LoggerName = sessionName;

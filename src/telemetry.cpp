@@ -593,23 +593,30 @@ static bool GetProcessExeName(DWORD pid, wchar_t* outName, DWORD maxLen) {
 static VOID WINAPI EtwEventRecordCallback(PEVENT_RECORD pEvent) {
     if (!pEvent) return;
     DWORD pid = pEvent->EventHeader.ProcessId;
+
+    static std::atomic<int> s_rawEvents{0};
+    int r = s_rawEvents.fetch_add(1, std::memory_order_relaxed);
+    if (r < 40) {
+        FpsLog("[ETW Raw Callback #%d] pid=%lu, id=%u, prov=0x%08X\n",
+               r + 1, pid, pEvent->EventHeader.EventDescriptor.Id,
+               pEvent->EventHeader.ProviderId.Data1);
+    }
+
     if (pid == 0 || pid == GetCurrentProcessId() || pid == GetDwmPid()) return;
 
-    // Supported Presentation Events across all graphics APIs:
-    // DXGI: 42 (Present_Start), 55 (PresentMultiplaneOverlay_Start / Independent Flip)
-    // D3D9: 1  (Present_Start)
-    // DxgKrnl (OpenGL / Vulkan / WDDM kernel presentation): 184 (Present_Start), 171 (SubmitPresentHistory)
     USHORT id = pEvent->EventHeader.EventDescriptor.Id;
+    uint32_t prov1 = pEvent->EventHeader.ProviderId.Data1;
     bool isPresent = false;
 
-    if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGI_PROVIDER_GUID)) {
-        // 42 = Present_Start, 55 = PresentMultiplaneOverlay_Start, 39 = SwapChain_Present_Start (Windowed), 53 = SwapChain_PresentMPO (Windowed)
+    // Fast and robust match by Provider GUID Data1 (0xCA11C036=DXGI, 0x783ACA0A=D3D9, 0x802EC45A=DXGKRNL):
+    if (prov1 == 0xCA11C036 || InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGI_PROVIDER_GUID)) {
+        // 42 = Present_Start, 55 = PresentMultiplaneOverlay_Start, 39 = SwapChain_Present_Start, 53 = SwapChain_PresentMPO
         if (id == 42 || id == 55 || id == 39 || id == 53) isPresent = true;
-    } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, D3D9_PROVIDER_GUID)) {
-        // 1 = Present_Start, 4 = PresentEx_Start (D3D9Ex Windowed Flip)
+    } else if (prov1 == 0x783ACA0A || InlineIsEqualGUID(pEvent->EventHeader.ProviderId, D3D9_PROVIDER_GUID)) {
+        // 1 = Present_Start, 4 = PresentEx_Start
         if (id == 1 || id == 4) isPresent = true;
-    } else if (InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGKRNL_PROVIDER_GUID)) {
-        // 184 = Present_Start, 171 = SubmitPresentHistory (Windowed Blt/Flip), 178 = SubmitPresentHistory_Start, 169 = Flip_Start, 170 = Flip, 311 = Token_PresentHistory, 312 = Token_PresentHistory_Start
+    } else if (prov1 == 0x802EC45A || InlineIsEqualGUID(pEvent->EventHeader.ProviderId, DXGKRNL_PROVIDER_GUID)) {
+        // 184 = Present_Start, 171 = SubmitPresentHistory, 178 = SubmitPresentHistory_Start, 169 = Flip_Start, 170 = Flip, 311 = Token_PresentHistory, 312 = Token_PresentHistory_Start
         if (id == 184 || id == 171 || id == 178 || id == 169 || id == 170 || id == 311 || id == 312) isPresent = true;
     }
 
@@ -1676,7 +1683,7 @@ void TelemetryEngine::StartEtwFpsThread() {
         auto* props = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(propBuf.data());
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 2; // System time (FILETIME, 100ns)
+        props->Wnode.ClientContext = 1; // High-resolution QPC clock matching PresentMon standard
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
@@ -1688,12 +1695,9 @@ void TelemetryEngine::StartEtwFpsThread() {
         memset(propBuf.data(), 0, propSize);
         props->Wnode.BufferSize = propSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
-        props->Wnode.ClientContext = 2;
+        props->Wnode.ClientContext = 1; // QPC clock (ProcessTrace delivers 100ns FILETIME)
         props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
         props->FlushTimer = 1; // Flush real-time buffers every 1 second
-        props->BufferSize = 64; // 64 KB buffers
-        props->MinimumBuffers = 4;
-        props->MaximumBuffers = 32;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
         props->LogFileNameOffset = 0; // MUST BE 0 FOR REAL_TIME_MODE!
 
